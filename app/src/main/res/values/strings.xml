@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">DHSN Stundenplan</string>
+    <string name="widget_description">Stundenplan als Widget mit Material You</string>
+    <string name="widget_label">Stundenplan</string>
+</resources>
