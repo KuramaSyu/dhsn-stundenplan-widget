@@ -179,45 +179,61 @@ object TimetableScraper {
         }
 
         val days = mutableMapOf<Int, DayPlan>()
+        // Per-column state for cells that were started in an earlier row and
+        // are still being visually carried into the current row via `rowspan`.
+        // `carryCount[c]` is the number of rows the carried cell still spans
+        // (0 once the cell is done). `carryLessons[c]` is the lessons to
+        // repeat for each carried row. We process the table top-to-bottom:
+        // for every row we walk Mon..Fri; for each column we either emit a
+        // carried slot (and decrement the counter) or pull the next `<td>`
+        // out of the row's cell list (skipping empty `<td> </td>` placeholders).
+        val carryCount = IntArray(5)
+        val carryLessons = arrayOfNulls<List<Lesson>>(5)
+
+        fun ensureDay(col: Int): DayPlan? {
+            val baseDate = weekdayDates.getOrNull(col) ?: return null
+            return days.getOrPut(col + 1) { DayPlan(baseDate, mutableListOf()) }
+        }
+
         for ((rowIndex, timeRow) in timeRows.withIndex()) {
             val cells = TD_CELL.findAll(timeRow.rowHtml).toList()
-            // Walk the <td>s left-to-right. Each <td> (empty or not) advances
-            // the weekday cursor (Mon..Fri). Cells that were visually carried
-            // in from the previous row via `rowspan` simply don't appear as
-            // <td>s in the rows they span, so the cursor stays correctly
-            // aligned even when intermediate cells are empty (`<td> </td>`
-            // with no class attribute).
-            var weekdayCursor = 1 // Monday
-            for (cellMatch in cells) {
+            var cellIdx = 0
+            for (col in 0 until 5) {
+                if (carryCount[col] > 0) {
+                    // The carried cell still has rows left. Emit a slot for
+                    // THIS row using the carried lessons; use the current
+                    // row's own <th class="zeit"> as the canonical time so
+                    // each carried slot lands at the right 90-min block.
+                    val day = ensureDay(col) ?: continue
+                    val dayList = day.slots as MutableList<LessonSlot>
+                    dayList.add(LessonSlot(timeRow.start, timeRow.end, carryLessons[col]!!))
+                    carryCount[col]--
+                    continue
+                }
+                if (cellIdx >= cells.size) continue
+                val cellMatch = cells[cellIdx]
+                cellIdx++
+
                 val attrs = cellMatch.groupValues[1]
                 val cellHtml = cellMatch.groupValues[2]
-                if (weekdayCursor > 5) continue // past Friday, ignore extras
-                val baseDate = weekdayDates.getOrNull(weekdayCursor - 1)
-                weekdayCursor++
-
                 if (!classNames(attrs).contains("Vorlesung")) continue
                 if (!cellHtml.contains("fach")) continue
-                if (baseDate == null) continue
 
                 val lessons = parseLessonsInCell(cellHtml, timeRow.start, timeRow.end)
                 if (lessons.isEmpty()) continue
 
-                // Rowspanned cell: emit ONE slot per spanned row, using each
-                // row's own <th class="zeit"> as the canonical time. That
-                // way a `rowspan=3` cell at 11:45-13:15 produces three
-                // 90-min slots at 11:45-13:15, 13:45-15:15 and 15:30-17:00
-                // instead of one merged 4.5h block. The carried rows below
-                // have no <td> in this column, so there's no risk of
-                // double-emitting.
+                // Rowspanned cell: emit ONE slot for the current row using
+                // its own <th class="zeit"> as the canonical time, then
+                // remember the lessons + remaining carry count so the
+                // following (rowspan-1) rows emit a carried slot each.
                 val rowspan = rowSpan(attrs).coerceAtLeast(1)
                 val span = minOf(rowspan, timeRows.size - rowIndex)
-                val day = days.getOrPut(weekdayCursor - 1) {
-                    DayPlan(baseDate, mutableListOf())
-                }
+                val day = ensureDay(col) ?: continue
                 val dayList = day.slots as MutableList<LessonSlot>
-                for (i in 0 until span) {
-                    val tr = timeRows[rowIndex + i]
-                    dayList.add(LessonSlot(tr.start, tr.end, lessons))
+                dayList.add(LessonSlot(timeRow.start, timeRow.end, lessons))
+                if (span > 1) {
+                    carryLessons[col] = lessons
+                    carryCount[col] = span - 1
                 }
             }
         }
@@ -290,7 +306,6 @@ object TimetableScraper {
     }
 
     /** Returns the integer rowspan value, defaulting to 1 if absent. */
-    @Suppress("unused")
     private fun rowSpan(attrs: String): Int =
         ROWSPAN_RE.find(attrs)?.groupValues?.get(1)?.toIntOrNull() ?: 1
 

@@ -2,6 +2,7 @@ package de.dhsn.stundenplan.data
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -237,6 +238,264 @@ class TimetableScraperTest {
         assertEquals("1.201", vsit.room)
         assertEquals("Büch", vsit.teacher)
         assertEquals("IT-Compliance WPF", vsit.remark)
+    }
+
+    // -----------------------------------------------------------------------
+    // Next week (KW 41, 5.10.2026 - 11.10.2026)
+    //
+    // Regression tests for the bug where the rowspans emitted by the BA
+    // server overlap with subsequent cells. Before the fix, the scraper
+    // reset the weekday cursor for every row, so cells that should have
+    // landed on Wed/Thu/Fri in row 3 and row 4 of the table were
+    // misassigned to Mon (because Mon was the only non-empty slot when
+    // the cursor was reset). The fix tracks which columns are still being
+    // carried over from a previous rowspan, and skips them so the next
+    // cell in the row's <td> list lands in the first non-carried column.
+    // -----------------------------------------------------------------------
+
+    @Test
+    fun `next week Monday 5 Oct 2026 has 5 slots with the right subjects`() {
+        // Layout (KW 41 Mon):
+        //   - 07:45-09:15 VSIT 2.015 (Winkl, L) + EVSA 2.119 (Nind, L) [rowspan=2]
+        //   - 09:45-11:15 VSIT + EVSA (carried)
+        //   - 11:45-13:15 DSDS Lund 2.234 (V) [rowspan=3]
+        //   - 13:45-15:15 DSDS Lund (carried)
+        //   - 15:30-17:00 DSDS Lund (carried)
+        val monday = dayOn(html, LocalDate.of(2026, 10, 5))
+        assertNotNull("Monday 2026-10-05 plan must exist", monday)
+        assertEquals(5, monday!!.slots.size)
+        assertEquals(
+            listOf(
+                LocalTime.of(7, 45) to LocalTime.of(9, 15),
+                LocalTime.of(9, 45) to LocalTime.of(11, 15),
+                LocalTime.of(11, 45) to LocalTime.of(13, 15),
+                LocalTime.of(13, 45) to LocalTime.of(15, 15),
+                LocalTime.of(15, 30) to LocalTime.of(17, 0),
+            ),
+            monday.slots.map { it.start to it.end },
+        )
+        val subjects = monday.slots.map { it.lessons.map(Lesson::subject) }
+        assertEquals(
+            listOf(
+                listOf("VSIT", "EVSA"),
+                listOf("VSIT", "EVSA"),
+                listOf("DSDS"),
+                listOf("DSDS"),
+                listOf("DSDS"),
+            ),
+            subjects,
+        )
+    }
+
+    @Test
+    fun `next week Tuesday 6 Oct 2026 has 5 slots with the right subjects`() {
+        // Layout (KW 41 Tue):
+        //   - 07:45-09:15 UES Püst 1.201 [rowspan=3]
+        //   - 09:45-11:15 UES Püst (carried)
+        //   - 11:45-13:15 UES Püst (carried, last row of rowspan=3)
+        //   - 13:45-15:15 UES Lund 3.204 (V) [rowspan=2]
+        //   - 15:30-17:00 UES Lund (carried)
+        // Critical: the DSDS Lund cell which the server emits in the row-3
+        // <td> list (col 2 of the source) must NOT bleed into Tuesday;
+        // it must stay in the Wed slot.
+        val tuesday = dayOn(html, LocalDate.of(2026, 10, 6))
+        assertNotNull("Tuesday 2026-10-06 plan must exist", tuesday)
+        assertEquals(5, tuesday!!.slots.size)
+        val subjects = tuesday.slots.map { it.lessons.map(Lesson::subject) }
+        assertEquals(
+            listOf(
+                listOf("UES"),
+                listOf("UES"),
+                listOf("UES"),
+                listOf("UES"),
+                listOf("UES"),
+            ),
+            subjects,
+        )
+        val teachers = tuesday.slots.map { it.lessons.map(Lesson::teacher) }
+        assertEquals(
+            listOf(
+                listOf("Püst"),
+                listOf("Püst"),
+                listOf("Püst"),
+                listOf("Lund"),
+                listOf("Lund"),
+            ),
+            teachers,
+        )
+    }
+
+    @Test
+    fun `next week Wednesday 7 Oct 2026 carries Wed slots over both column shifts`() {
+        // Layout (KW 41 Wed):
+        //   - 07:45-09:15 DSDS Bode 2.234 (IT+MI) [rowspan=2]
+        //   - 09:45-11:15 DSDS Bode (carried)
+        //   - 11:45-13:15 DSDS Lund 2.234 (V) [rowspan=3] (the second <td>
+        //     in row 3 of the source HTML; it visually sits at Wed because
+        //     Tue is being carried from UES Püst's rowspan=3)
+        //   - 13:45-15:15 DSDS Lund (carried)
+        //   - 15:30-17:00 DSDS Lund (carried)
+        val wednesday = dayOn(html, LocalDate.of(2026, 10, 7))
+        assertNotNull("Wednesday 2026-10-07 plan must exist", wednesday)
+        assertEquals(5, wednesday!!.slots.size)
+        val subjects = wednesday.slots.map { it.lessons.map(Lesson::subject) }
+        assertEquals(
+            listOf(
+                listOf("DSDS"),
+                listOf("DSDS"),
+                listOf("DSDS"),
+                listOf("DSDS"),
+                listOf("DSDS"),
+            ),
+            subjects,
+        )
+        val teachers = wednesday.slots.map { it.lessons.map(Lesson::teacher) }
+        assertEquals(
+            listOf(
+                listOf("Bode"),
+                listOf("Bode"),
+                listOf("Lund"),
+                listOf("Lund"),
+                listOf("Lund"),
+            ),
+            teachers,
+        )
+    }
+
+    @Test
+    fun `next week Thursday 8 Oct 2026 has EVSA-VSIT and VSIT-Buech blocks`() {
+        // Layout (KW 41 Thu):
+        //   - 07:45-09:15 EVSA 1.201 (Nind, Ü) + VSIT 1.202 (Winkl, V) [rowspan=2]
+        //   - 09:45-11:15 EVSA + VSIT (carried)
+        //   - 11:45-13:15 VSIT Büch 1.201 (IT-Compliance WPF) [rowspan=2]
+        //     (third <td> in row 3 of source; lands at Thu because Wed and
+        //     Tue are being carried, Mon took row-3 cell 1 and Fri is
+        //     carried from row 1)
+        //   - 13:45-15:15 VSIT Büch (carried)
+        val thursday = dayOn(html, LocalDate.of(2026, 10, 8))
+        assertNotNull("Thursday 2026-10-08 plan must exist", thursday)
+        assertEquals(4, thursday!!.slots.size)
+        val slots = thursday.slots
+        // Slot 1: EVSA + VSIT parallel block
+        val first = slots[0]
+        assertEquals(LocalTime.of(7, 45), first.start)
+        assertEquals(2, first.lessons.size)
+        assertEquals("EVSA", first.lessons[0].subject)
+        assertEquals("Nind", first.lessons[0].teacher)
+        assertEquals("1.201", first.lessons[0].room)
+        assertEquals("Ü", first.lessons[0].kind)
+        assertEquals("VSIT", first.lessons[1].subject)
+        assertEquals("Winkl", first.lessons[1].teacher)
+        assertEquals("1.202", first.lessons[1].room)
+        assertEquals("V", first.lessons[1].kind)
+        // Slot 2: carried parallel block (same content, different time)
+        assertEquals(LocalTime.of(9, 45), slots[1].start)
+        assertEquals(2, slots[1].lessons.size)
+        assertEquals("EVSA", slots[1].lessons[0].subject)
+        assertEquals("VSIT", slots[1].lessons[1].subject)
+        // Slot 3: VSIT Büch at 1.201
+        val third = slots[2]
+        assertEquals(LocalTime.of(11, 45), third.start)
+        assertEquals("VSIT", third.lessons.single().subject)
+        assertEquals("Büch", third.lessons.single().teacher)
+        assertEquals("1.201", third.lessons.single().room)
+        assertEquals("IT-Compliance WPF", third.lessons.single().remark)
+        // Slot 4: carried VSIT Büch
+        assertEquals(LocalTime.of(13, 45), slots[3].start)
+        assertEquals("VSIT", slots[3].lessons.single().subject)
+        assertEquals("Büch", slots[3].lessons.single().teacher)
+    }
+
+    @Test
+    fun `next week Friday 9 Oct 2026 has two distinct DVS rooms`() {
+        // Layout (KW 41 Fri):
+        //   - 07:45-09:15 DVS Hänel 2.119 (L) [rowspan=3]
+        //   - 09:45-11:15 DVS Hänel 2.119 (carried)
+        //   - 11:45-13:15 DVS Hänel 2.119 (carried, last row of rowspan=3)
+        //   - 13:45-15:15 DVS Hänel 2.015 (L) [rowspan=2]
+        //     (second <td> in row 4 of source; lands at Fri because Mon,
+        //     Tue and Wed are carried)
+        //   - 15:30-17:00 DVS Hänel 2.015 (carried)
+        val friday = dayOn(html, LocalDate.of(2026, 10, 9))
+        assertNotNull("Friday 2026-10-09 plan must exist", friday)
+        assertEquals(5, friday!!.slots.size)
+        val rooms = friday.slots.map { it.lessons.single().room }
+        assertEquals(
+            listOf("2.119", "2.119", "2.119", "2.015", "2.015"),
+            rooms,
+        )
+        val starts = friday.slots.map { it.start }
+        assertEquals(
+            listOf(
+                LocalTime.of(7, 45),
+                LocalTime.of(9, 45),
+                LocalTime.of(11, 45),
+                LocalTime.of(13, 45),
+                LocalTime.of(15, 30),
+            ),
+            starts,
+        )
+    }
+
+    @Test
+    fun `next week does not bleed row 3 and row 4 cells into Monday`() {
+        // The original bug: the weekday cursor was reset to Monday at the
+        // start of every row, so the row-4 cell UES Lund (3.204) and the
+        // row-4 cell DVS Hänel (2.015) were misassigned to Monday in
+        // addition to their correct weekday. This left Monday with seven
+        // slots instead of five (two of which were the Tue/Fri cells).
+        val monday = dayOn(html, LocalDate.of(2026, 10, 5))!!
+        // Every lesson on Monday must come from Monday's actual cells in
+        // the source. That excludes UES (which is only on Tue) and any
+        // DVS / VSIT-Büch cells that start on Wednesday / Thursday / Friday.
+        for (slot in monday.slots) {
+            for (lesson in slot.lessons) {
+                assertTrue(
+                    "Monday must not contain '${lesson.subject}' (was '$lesson')",
+                    lesson.subject != "UES",
+                )
+                assertTrue(
+                    "Monday must not contain DVS at room 2.015 (Fri's afternoon cell): '$lesson'",
+                    !(lesson.subject == "DVS" && lesson.room == "2.015"),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `KW 42 Monday 12 Oct 2026 carries VSIT-EVSA through 3 rows and lands DSDS only on rows 4-5`() {
+        // Regression test for KW 42 (week 2 of the fixture) where the
+        // original cursor-reset bug also produced duplicate UES-Püst
+        // slots on Monday. Layout (KW 42 Mon):
+        //   - 07:45-09:15 VSIT + EVSA [rowspan=3]
+        //   - 09:45-11:15 VSIT + EVSA (carried)
+        //   - 11:45-13:15 VSIT + EVSA (carried, last row of rowspan=3)
+        //   - 13:45-15:15 DSDS Lund 2.234 (V) [rowspan=2]
+        //   - 15:30-17:00 DSDS Lund (carried)
+        val monday = dayOn(html, LocalDate.of(2026, 10, 12))!!
+        assertEquals(5, monday.slots.size)
+        val subjects = monday.slots.map { it.lessons.map(Lesson::subject) }
+        assertEquals(
+            listOf(
+                listOf("VSIT", "EVSA"),
+                listOf("VSIT", "EVSA"),
+                listOf("VSIT", "EVSA"),
+                listOf("DSDS"),
+                listOf("DSDS"),
+            ),
+            subjects,
+        )
+        // Make sure no UES Püst leaks into Monday (Wed UES Püst's cells
+        // would otherwise be placed at Mon by the buggy cursor).
+        for (slot in monday.slots) {
+            for (lesson in slot.lessons) {
+                assertNotEquals(
+                    "Monday KW 42 must not contain '${lesson.subject}'",
+                    "UES",
+                    lesson.subject,
+                )
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

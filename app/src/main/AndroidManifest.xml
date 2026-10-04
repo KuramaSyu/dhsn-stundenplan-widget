@@ -19,12 +19,11 @@
                 android:resource="@xml/stundenplan_widget_info" />
         </receiver>
 
-        <!-- Launcher activity: a minimal hint screen so the project is
-             launchable from Android Studio (Run / Debug) and from the
-             device's app drawer. The widget itself is added via the
-             homescreen's widget picker. -->
+        <!-- Launcher activity: opens the in-app vertical timeline view of
+             the stundenplan. This is the activity the device launches when
+             the user taps the app icon in the launcher / drawer. -->
         <activity
-            android:name=".config.MainActivity"
+            android:name=".config.TimelineActivity"
             android:exported="true"
             android:label="@string/app_name">
             <intent-filter>
@@ -32,6 +31,15 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Settings / widget-instance list. Still in the manifest so it
+             can be navigated to (and so the project remains launchable
+             from older app shortcuts), but no longer the launcher entry
+             point — the timeline above is. -->
+        <activity
+            android:name=".config.MainActivity"
+            android:exported="true"
+            android:label="@string/app_name" />
 
         <!-- Configuration activity shown automatically when the user adds
              the widget. -->

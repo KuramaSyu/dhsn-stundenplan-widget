@@ -7,6 +7,7 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -81,6 +82,19 @@ class HttpUrlConnectionFetcher(
  *   - a tiny in-memory + DataStore-backed cache for "today's lessons" and
  *     the "last fetched" timestamp so the widget can render something useful
  *     even when the device is offline.
+ *
+ * ## Caching model
+ *
+ * The BA server returns up to 8 weeks of data in one HTML response. To avoid
+ * the classic "concurrent `week()` calls race on a single-date cache" bug we
+ * cache the **full** 8-week parse per classId in `weeksCache`. A single
+ * network fetch therefore populates every day in the visible range at once,
+ * and a subsequent `week()` for an adjacent week reuses the same in-memory
+ * parse instead of triggering another HTTP request.
+ *
+ * On-disk we still persist exactly one `DaySnapshot` per classId (today's
+ * slots), because the widget needs to render something quickly after a cold
+ * start before any coroutine has had a chance to fetch.
  */
 object TimetableRepository {
 
@@ -153,55 +167,45 @@ object TimetableRepository {
             }
         }
 
-        val url = buildUrl(context, appWidgetId, classId)
-        Log.i(TAG, "day($date) cache miss — fetching $url")
-        return try {
-            val html = withContext(Dispatchers.IO) { fetcher.fetch(url) }
-            Log.d(TAG, "fetched ${html.length} bytes")
-            val weeks = TimetableScraper.parseWeeks(html)
-            Log.d(TAG, "parsed ${weeks.size} week(s)")
-            // Look up the requested date in any of the parsed weeks; this
-            // also gives us a chance to update the snapshot for [today] so
-            // that a navigation back to "today" reuses fresh data without
-            // hitting the network again.
-            val dayPlan = TimetableScraper.parseDay(html, date)
+        Log.i(TAG, "day($date) cache miss — fetching classId=$classId")
+        val parsedWeeks = fetchAndCacheWeeks(context, appWidgetId)
+        if (parsedWeeks != null) {
+            val dayPlan = findDayPlan(parsedWeeks, date)
             if (dayPlan != null) {
                 val slots = dayPlan.slots
                 Log.i(TAG, "day($date) hit slots=${slots.size} lessons=${slots.sumOf { it.lessons.size }}")
                 val snap = DaySnapshot(date, slots)
                 memoryCache[classId] = snap
                 persist(context, classId, snap)
-                slots
-            } else {
-                Log.w(TAG, "day($date) not in fetched weeks ($date)")
-                // The fetched page covers a different date range. If [date]
-                // is "today", try to find today's dayPlan inside the page
-                // so we still update the cache for subsequent calls.
-                if (date == today) {
-                    val todayPlan = TimetableScraper.parseDay(html, today)
-                    if (todayPlan != null) {
-                        val snap = DaySnapshot(today, todayPlan.slots)
-                        memoryCache[classId] = snap
-                        persist(context, classId, snap)
-                    }
+                return slots
+            }
+            // The fetched page covers a different date range. If [date]
+            // is "today", try to find today's dayPlan inside the page
+            // so we still update the cache for subsequent calls.
+            if (date == today) {
+                val todayPlan = findDayPlan(parsedWeeks, today)
+                if (todayPlan != null) {
+                    val snap = DaySnapshot(today, todayPlan.slots)
+                    memoryCache[classId] = snap
+                    persist(context, classId, snap)
                 }
-                emptyList()
             }
-        } catch (e: Throwable) {
-            Log.e(TAG, "day($date) fetch/parse failed: ${e.javaClass.simpleName}: ${e.message}", e)
-            // Fall back to the most-recent cached snapshot for this
-            // classId, regardless of its date. The user explicitly asked
-            // for "always fall back to the old one if new one failed" so
-            // we never throw away data we already have on disk / in
-            // memory unless the cache is genuinely empty.
-            val anyCached = memoryCache[classId] ?: readPersisted(context, classId)
-            if (anyCached != null) {
-                Log.w(TAG, "day($date) serving stale cache from ${anyCached.date}")
-                anyCached.slots
-            } else {
-                Log.w(TAG, "day($date) no cache available — falling back to dummy")
-                dummyFor(date.dayOfWeek.value)
-            }
+            Log.w(TAG, "day($date) not in fetched weeks")
+            return emptyList()
+        }
+
+        // Fetch failed — fall back to whatever we still have on disk / in
+        // memory, regardless of its date. The user explicitly asked for
+        // "always fall back to the old one if new one failed" so we never
+        // throw away data we already have unless the cache is genuinely
+        // empty.
+        val anyCached = memoryCache[classId] ?: readPersisted(context, classId)
+        return if (anyCached != null) {
+            Log.w(TAG, "day($date) serving stale cache from ${anyCached.date}")
+            anyCached.slots
+        } else {
+            Log.w(TAG, "day($date) no cache available — falling back to dummy")
+            dummyFor(date.dayOfWeek.value)
         }
     }
 
@@ -213,38 +217,99 @@ object TimetableRepository {
         day(context, appWidgetId, LocalDate.now())
 
     /**
+     * Returns the [DayPlan]s for the week containing [monday], Mon–Fri.
+     *
+     * The BA server returns up to 8 weeks of HTML in a single response, so we
+     * fetch once and serve all five weekdays from the same parsed result.
+     * This is important for two reasons:
+     *
+     *   - It halves the network traffic for first-time views of a week.
+     *   - It eliminates the previous race where two concurrent `week()`
+     *     calls each ran their own refresh and raced to write a per-date
+     *     `DaySnapshot` — the last write won, sometimes from a cancelled
+     *     call, leaving the screen showing the wrong week.
+     *
+     * Resolution order:
+     *   1. If the in-memory `weeksCache` for this classId already contains
+     *      all five weekdays, build `DayPlan`s from it (no network).
+     *   2. Otherwise issue a single network fetch, parse all weeks, store
+     *      the result in `weeksCache`, and build the five `DayPlan`s from
+     *      it.
+     *   3. On failure, fall back to per-date `day()` calls which can use
+     *      stale cache / disk / dummy. This never throws — the widget
+     *      always gets five `DayPlan`s back.
+     */
+    suspend fun week(
+        context: Context,
+        appWidgetId: Int? = null,
+        monday: LocalDate,
+    ): List<DayPlan> {
+        val classId = resolveClassId(context, appWidgetId)
+        val dates = (0..4).map { monday.plusDays(it.toLong()) }
+
+        // Cheap path: every weekday is already in the in-memory 8-week
+        // cache. No network needed; just stitch five DayPlans together.
+        val cached = weeksCache[classId]
+        if (cached != null && dates.all { d -> findDayPlan(cached.weeks, d) != null }) {
+            Log.d(TAG, "week($monday) full cache hit classId=$classId")
+            return dates.map { d -> findDayPlan(cached.weeks, d)!! }
+        }
+
+        // Cache miss (or partial miss). Fetch once and look up everything
+        // we need inside the parsed weeks. This replaces the old
+        // `runCatching { refresh(...) }` pattern which triggered a second
+        // concurrent network call (and was the source of the race).
+        Log.i(TAG, "week($monday) partial cache miss — fetching classId=$classId")
+        val parsedWeeks = fetchAndCacheWeeks(context, appWidgetId)
+        if (parsedWeeks != null) {
+            val out = mutableListOf<DayPlan>()
+            for (date in dates) {
+                val plan = findDayPlan(parsedWeeks, date)
+                if (plan != null) {
+                    out.add(plan)
+                } else {
+                    // Date outside the server's returned range — build a
+                    // synthetic empty DayPlan so the UI still gets 5
+                    // entries.
+                    out.add(DayPlan(date, emptyList()))
+                }
+            }
+            return out
+        }
+
+        // Fetch failed: fall back to per-date `day()` calls. Each one can
+        // still hit stale memory cache, stale disk, or dummy data — so the
+        // user always sees something.
+        Log.w(TAG, "week($monday) fetch failed — falling back to per-date day() calls")
+        return dates.map { date -> DayPlan(date, day(context, appWidgetId, date)) }
+    }
+
+    /**
      * Force a network fetch (ignoring caches). Returns the slots that were
      * fetched (which may be empty if today has no lessons), or null on
      * network / parse failure so the caller can keep showing cached data.
      */
     suspend fun refresh(context: Context, appWidgetId: Int? = null): List<LessonSlot>? {
         val classId = resolveClassId(context, appWidgetId)
-        val url = buildUrl(context, appWidgetId, classId)
-        Log.i(TAG, "refresh() starting classId=$classId url=$url")
-        return try {
-            val html = withContext(Dispatchers.IO) { fetcher.fetch(url) }
-            Log.d(TAG, "refresh() fetched ${html.length} bytes")
-            val today = LocalDate.now()
-            val dayPlan = TimetableScraper.parseDay(html, today)
-            if (dayPlan != null) {
-                val snap = DaySnapshot(today, dayPlan.slots)
-                memoryCache[classId] = snap
-                persist(context, classId, snap)
-                Log.i(TAG, "refresh() ok slots=${dayPlan.slots.size}")
-                dayPlan.slots
-            } else {
-                // Page returned no day plan for today (e.g. semester break).
-                // Cache an empty snapshot for today so we don't re-fetch
-                // uselessly until the date rolls over.
-                val snap = DaySnapshot(today, emptyList())
-                memoryCache[classId] = snap
-                persist(context, classId, snap)
-                Log.i(TAG, "refresh() ok (no lessons today) slots=0")
-                emptyList()
-            }
-        } catch (e: Throwable) {
-            Log.e(TAG, "refresh() failed: ${e.javaClass.simpleName}: ${e.message}", e)
-            null
+        Log.i(TAG, "refresh() starting classId=$classId")
+        val parsedWeeks = fetchAndCacheWeeks(context, appWidgetId) ?: return null
+        val today = LocalDate.now()
+        val todayPlan = findDayPlan(parsedWeeks, today)
+        return if (todayPlan != null) {
+            val snap = DaySnapshot(today, todayPlan.slots)
+            memoryCache[classId] = snap
+            persist(context, classId, snap)
+            Log.i(TAG, "refresh() ok slots=${todayPlan.slots.size}")
+            todayPlan.slots
+        } else {
+            // Page returned no day plan for today (e.g. semester break).
+            // Cache an empty snapshot for today so we don't re-fetch
+            // uselessly until the date rolls over.
+            val snap = DaySnapshot(today, emptyList())
+            memoryCache[classId] = snap
+            persist(context, classId, snap)
+            Log.i(TAG, "refresh() ok (no lessons today) slots=0")
+            emptyList()
         }
     }
 
@@ -266,6 +331,8 @@ object TimetableRepository {
         for (classId in distinct) {
             val res = try {
                 refreshFor(context, classId)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Throwable) {
                 Log.e(TAG, "refreshAll() failed for $classId: ${e.message}", e)
                 null
@@ -276,31 +343,28 @@ object TimetableRepository {
     }
 
     private suspend fun refreshFor(context: Context, classId: String): List<LessonSlot>? {
-        val url = buildUrl(context, null, classId)
-        return try {
-            val html = withContext(Dispatchers.IO) { fetcher.fetch(url) }
-            val today = LocalDate.now()
-            val dayPlan = TimetableScraper.parseDay(html, today)
-            if (dayPlan != null) {
-                val snap = DaySnapshot(today, dayPlan.slots)
-                memoryCache[classId] = snap
-                persist(context, classId, snap)
-                dayPlan.slots
-            } else {
-                val snap = DaySnapshot(today, emptyList())
-                memoryCache[classId] = snap
-                persist(context, classId, snap)
-                emptyList()
-            }
-        } catch (e: Throwable) {
-            Log.e(TAG, "refreshFor($classId) failed: ${e.message}", e)
-            null
+        Log.i(TAG, "refreshFor($classId) starting")
+        val parsedWeeks = fetchAndCacheWeeks(context, null, classId) ?: return null
+        val today = LocalDate.now()
+        val todayPlan = findDayPlan(parsedWeeks, today)
+        return if (todayPlan != null) {
+            val snap = DaySnapshot(today, todayPlan.slots)
+            memoryCache[classId] = snap
+            persist(context, classId, snap)
+            todayPlan.slots
+        } else {
+            val snap = DaySnapshot(today, emptyList())
+            memoryCache[classId] = snap
+            persist(context, classId, snap)
+            emptyList()
         }
     }
 
     private suspend fun resolveClassIdOrNull(context: Context, appWidgetId: Int): String? =
         try {
             WidgetConfigStore(context).getClassId(appWidgetId)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Throwable) {
             Log.w(TAG, "resolveClassIdOrNull($appWidgetId) failed: ${e.message}")
             null
@@ -334,10 +398,75 @@ object TimetableRepository {
             WidgetConfigStore(context).getClassId(id)
         } ?: DEFAULT_CLASS_ID
 
-    /** In-memory cache: one entry per configured classId. */
+    /**
+     * In-memory cache: one entry per configured classId. Stores the slots
+     * for a SINGLE date so the widget can render quickly after a cold
+     * start. The "today's slots" storage is intentionally separate from
+     * [weeksCache] because the widget only ever needs one day at a time
+     * and [DaySnapshot]'s on-disk format was designed for that case.
+     */
     private val memoryCache = mutableMapOf<String, DaySnapshot>()
 
+    /**
+     * In-memory cache: one entry per configured classId. Stores the full
+     * 8-week parse of the most recent HTML response so that [week] and
+     * [day] can serve any weekday in O(1) lookups without a second
+     * network round-trip. Populated by [fetchAndCacheWeeks].
+     */
+    private val weeksCache = mutableMapOf<String, WeekCache>()
+
     private data class DaySnapshot(val date: LocalDate, val slots: List<LessonSlot>)
+
+    private data class WeekCache(
+        val fetchedAt: LocalDateTime,
+        val weeks: List<WeekPlan>,
+    )
+
+    /**
+     * Fetch the BA PlanServlet HTML once for [classId], parse it into the
+     * full 8-week structure, store it in [weeksCache] keyed by [classId],
+     * and return the parsed weeks. Returns null on any failure (network,
+     * parse, etc.) so the caller can decide on a fallback strategy.
+     *
+     * Cancellation is honoured: a [CancellationException] thrown while
+     * fetching or parsing is re-raised so coroutine cancellation can
+     * actually cancel the work — unlike `runCatching { … }` which would
+     * swallow it and let a cancelled call still write into the cache.
+     */
+    private suspend fun fetchAndCacheWeeks(
+        context: Context,
+        appWidgetId: Int?,
+        overrideClassId: String? = null,
+    ): List<WeekPlan>? {
+        val classId = overrideClassId ?: resolveClassId(context, appWidgetId)
+        val url = buildUrl(context, appWidgetId, classId)
+        Log.i(TAG, "fetchAndCacheWeeks($classId) starting url=$url")
+        return try {
+            val html = withContext(Dispatchers.IO) { fetcher.fetch(url) }
+            val weeks = TimetableScraper.parseWeeks(html)
+            Log.d(TAG, "fetched ${html.length} bytes, parsed ${weeks.size} week(s)")
+            weeksCache[classId] = WeekCache(LocalDateTime.now(), weeks)
+            weeks
+        } catch (e: CancellationException) {
+            // Honour coroutine cancellation — do NOT cache the partial
+            // result and do NOT swallow the exception.
+            Log.d(TAG, "fetchAndCacheWeeks($classId) cancelled")
+            throw e
+        } catch (e: Throwable) {
+            Log.e(TAG, "fetchAndCacheWeeks($classId) failed: ${e.javaClass.simpleName}: ${e.message}", e)
+            null
+        }
+    }
+
+    /**
+     * Look up the day matching [date] across all parsed [weeks], or null if
+     * no parsed week contains it. Centralised so [day] and [week] agree on
+     * the matching rule.
+     */
+    private fun findDayPlan(weeks: List<WeekPlan>, date: LocalDate): DayPlan? =
+        weeks.firstNotNullOfOrNull { week ->
+            week.days.values.firstOrNull { it.date == date }
+        }
 
     private fun snapshotKey(classId: String) = stringPreferencesKey("lessons_$classId")
     private fun stampKey(classId: String) = stringPreferencesKey("stamp_$classId")
@@ -358,6 +487,8 @@ object TimetableRepository {
             val slotsRaw = parts[1].split("|")
             val slots = slotsRaw.mapNotNull(::decodeSlot)
             DaySnapshot(date, slots)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Throwable) {
             Log.w(TAG, "readPersisted($classId) failed: ${e.message}")
             null
@@ -375,6 +506,8 @@ object TimetableRepository {
                 }
                 prefs[snapshotKey(classId)] = payload
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Throwable) {
             Log.w(TAG, "persist($classId) failed: ${e.message}")
         }
@@ -386,6 +519,8 @@ object TimetableRepository {
             .first()
         raw ?: return null
         runCatching { LocalDateTime.parse(raw) }.getOrNull()
+    } catch (e: CancellationException) {
+        throw e
     } catch (e: Throwable) {
         Log.w(TAG, "readStamp($classId) failed: ${e.message}")
         null
