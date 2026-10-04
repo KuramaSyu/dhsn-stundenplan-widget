@@ -187,6 +187,15 @@ object TimetableScraper {
         // for every row we walk Mon..Fri; for each column we either emit a
         // carried slot (and decrement the counter) or pull the next `<td>`
         // out of the row's cell list (skipping empty `<td> </td>` placeholders).
+        //
+        // The BA server emits rows in two shapes:
+        //   - "sparse" rows: fewer than 5 `<td>` entries, positioned 1:1 with
+        //     the non-carried weekday columns; carried columns have no cell
+        //     at all in the row.
+        //   - "full" rows: exactly 5 `<td>` entries, one per weekday column;
+        //     carried columns get an empty `<td> </td>` placeholder.
+        // We detect the full shape by counting cells and switch alignment
+        // so that both shapes are decoded correctly.
         val carryCount = IntArray(5)
         val carryLessons = arrayOfNulls<List<Lesson>>(5)
 
@@ -197,22 +206,32 @@ object TimetableScraper {
 
         for ((rowIndex, timeRow) in timeRows.withIndex()) {
             val cells = TD_CELL.findAll(timeRow.rowHtml).toList()
+            val fullAlignment = cells.size == 5
             var cellIdx = 0
             for (col in 0 until 5) {
                 if (carryCount[col] > 0) {
-                    // The carried cell still has rows left. Emit a slot for
-                    // THIS row using the carried lessons; use the current
-                    // row's own <th class="zeit"> as the canonical time so
-                    // each carried slot lands at the right 90-min block.
+                    // Carried cell still has rows left. Emit a slot for THIS
+                    // row using the carried lessons. In full alignment the
+                    // matching `<td>` (if any) is an empty placeholder for
+                    // the carried column, so we deliberately do NOT consume
+                    // it.
                     val day = ensureDay(col) ?: continue
                     val dayList = day.slots as MutableList<LessonSlot>
                     dayList.add(LessonSlot(timeRow.start, timeRow.end, carryLessons[col]!!))
                     carryCount[col]--
                     continue
                 }
-                if (cellIdx >= cells.size) continue
-                val cellMatch = cells[cellIdx]
-                cellIdx++
+                val cellMatch = if (fullAlignment) {
+                    // cells[col] is the cell for column `col`.
+                    if (col >= cells.size) continue
+                    cells[col]
+                } else if (cellIdx >= cells.size) {
+                    continue
+                } else {
+                    val m = cells[cellIdx]
+                    cellIdx++
+                    m
+                }
 
                 val attrs = cellMatch.groupValues[1]
                 val cellHtml = cellMatch.groupValues[2]

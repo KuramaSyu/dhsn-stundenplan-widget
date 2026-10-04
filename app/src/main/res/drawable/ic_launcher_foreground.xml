@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Adaptive icon foreground for the DHSN Stundenplan launcher icon.
+
+    Path data taken verbatim from Google's Material Symbols "Event"
+    icon (24dp / weight 400 / grade 0 / opsz 24), file:
+        C:\Users\paulz\Downloads\event_24dp_E3E3E3_FILL0_wght400_GRAD0_opsz24.svg
+
+    The source SVG uses viewBox "0 -960 960 960". We keep that exact
+    viewBox here so the path data is unchanged, then the <group>
+    transform centres and scales the icon to fit inside the 66dp
+    adaptive-icon safe zone of the 108x108 viewport.
+
+    Coordinate transform:
+        x_new = (x_src + 0)   * scale   (0..960 -> 0..108)
+        y_new = (y_src + 960) * scale   (-960..0 -> 0..108)
+    with scale = 108/960 = 0.1125 and translate_y = +108.
+
+    Colours follow the DHSN brand:
+      * calendar body + stems + divider    #00AEEF (DHSN blue)
+      * centre date block                  #E2001A (DHSN red)
+      * background                        #FFFFFF (white)
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!--
+        The source SVG is 960 units wide and tall (viewBox
+        "0 -960 960 960"), but only the inner ~720x640 area
+        contains ink (roughly x in [120, 840], y in [-800, -80]).
+
+        To fit it comfortably inside the adaptive-icon safe zone
+        (66dp circle inside the 108x108 viewport) with a margin,
+        we use scale = 0.085 instead of 0.1125 (about 76% of the
+        viewport) and centre it with translate (x, y) = (12, 132).
+        This gives about 16 units of clear space on each side, so
+        the launcher's circular mask never clips the calendar.
+    -->
+    <group
+        android:translateX="20"
+        android:translateY="85"
+        android:scaleX="0.07"
+        android:scaleY="0.07">
+
+        <!-- Calendar body + stems + header divider, filled in DHSN
+             blue. The source SVG path data uses non-zero fill, so
+             the inner rectangles (M200-160..., M200-640...) cut out
+             from the body shape, producing the calendar outline. -->
+        <path
+            android:fillColor="#00AEEF"
+            android:pathData="M200,-80
+                              q-33,0 -56.5,-23.5
+                              T120,-160
+                              v-560
+                              q0,-33 23.5,-56.5
+                              T200,-800
+                              h40
+                              v-80
+                              h80
+                              v80
+                              h320
+                              v-80
+                              h80
+                              v80
+                              h40
+                              q33,0 56.5,23.5
+                              T840,-720
+                              v560
+                              q0,33 -23.5,56.5
+                              T760,-80
+                              H200
+                              Z
+                              M200,-160
+                              h560
+                              v-400
+                              H200
+                              Z
+                              M200,-640
+                              h560
+                              v-80
+                              H200
+                              Z" />
+
+        <!-- Centre date block (red). -->
+        <path
+            android:fillColor="#E2001A"
+            android:pathData="M509,-269
+                              q-29,-29 -29,-71
+                              t29,-71
+                              q29,-29 71,-29
+                              t71,29
+                              q29,29 29,71
+                              t-29,71
+                              q-29,29 -71,29
+                              t-71,-29
+                              Z" />
+    </group>
+</vector>

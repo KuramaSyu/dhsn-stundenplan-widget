@@ -499,6 +499,205 @@ class TimetableScraperTest {
     }
 
     // -----------------------------------------------------------------------
+    // KW 43 (19.10.2026 - 25.10.2026)
+    //
+    // Regression tests for the BA server's "full row" shape where the HTML
+    // emits exactly 5 `<td>` entries (one per weekday column), including
+    // empty `<td> </td>` placeholders for carried columns and columns with
+    // no lesson. The original cellIdx-based alignment treated every cell
+    // as if it were for the next non-carried column, so the placeholder
+    // `<td> </td>` for a carried column (e.g. Tue in row 5) was consumed
+    // at the next non-carried column's slot, throwing off the alignment
+    // for any real cell that followed it. The result was that the
+    // Thursday 15:30-17:00 UES Püst 3.104 (Zusammen) slot was silently
+    // dropped. The fix detects rows with 5 cells and switches to
+    // 1:1 column alignment.
+    // -----------------------------------------------------------------------
+
+    @Test
+    fun `KW 43 Monday 19 Oct 2026 has no lessons`() {
+        // The fixture's KW 43 has zero cells in any of Monday's 5 rows
+        // (the server emits `<td> </td>` placeholders everywhere, with Tue
+        // and Fri still being carried from rows 3+5 above). The scraper
+        // must therefore never insert a slot for Monday, and the day is
+        // absent from the parsed week entirely (the DayPlan is created
+        // lazily on the first lesson).
+        val monday = dayOn(html, LocalDate.of(2026, 10, 19))
+        assertNull("Monday 2026-10-19 has no lessons and must be absent", monday)
+    }
+
+    @Test
+    fun `KW 43 Tuesday 20 Oct 2026 carries DVS across row 2 then UES Pust across rows 4-5`() {
+        // Layout (KW 43 Tue):
+        //   - 07:45-09:15 DVS Hänel 2.119 (L) [rowspan=2]
+        //   - 09:45-11:15 DVS Hänel (carried)
+        //   - 11:45-13:15 UES Püst 2.234 (V) (Zusammen) [rowspan=3]
+        //   - 13:45-15:15 UES Püst (carried)
+        //   - 15:30-17:00 UES Püst (carried)
+        val tuesday = dayOn(html, LocalDate.of(2026, 10, 20))
+        assertNotNull("Tuesday 2026-10-20 plan must exist", tuesday)
+        assertEquals(5, tuesday!!.slots.size)
+        val starts = tuesday.slots.map { it.start }
+        val ends = tuesday.slots.map { it.end }
+        assertEquals(
+            listOf(
+                LocalTime.of(7, 45),
+                LocalTime.of(9, 45),
+                LocalTime.of(11, 45),
+                LocalTime.of(13, 45),
+                LocalTime.of(15, 30),
+            ),
+            starts,
+        )
+        assertEquals(
+            listOf(
+                LocalTime.of(9, 15),
+                LocalTime.of(11, 15),
+                LocalTime.of(13, 15),
+                LocalTime.of(15, 15),
+                LocalTime.of(17, 0),
+            ),
+            ends,
+        )
+        // Slot 1: DVS Hänel
+        val first = tuesday.slots[0].lessons.single()
+        assertEquals("DVS", first.subject)
+        assertEquals("Hänel", first.teacher)
+        assertEquals("2.119", first.room)
+        // Slot 2: DVS Hänel (carried)
+        val second = tuesday.slots[1].lessons.single()
+        assertEquals("DVS", second.subject)
+        assertEquals("Hänel", second.teacher)
+        assertEquals("2.119", second.room)
+        // Slot 3: UES Püst with "Zusammen" remark
+        val third = tuesday.slots[2].lessons.single()
+        assertEquals("UES", third.subject)
+        assertEquals("Püst", third.teacher)
+        assertEquals("2.234", third.room)
+        assertEquals("Zusammen", third.remark)
+        // Slot 4: UES Püst (carried, same content)
+        val fourth = tuesday.slots[3].lessons.single()
+        assertEquals("UES", fourth.subject)
+        assertEquals("Püst", fourth.teacher)
+        assertEquals("2.234", fourth.room)
+        assertEquals("Zusammen", fourth.remark)
+        // Slot 5: UES Püst (carried, last row of rowspan=3)
+        val fifth = tuesday.slots[4].lessons.single()
+        assertEquals("UES", fifth.subject)
+        assertEquals("Püst", fifth.teacher)
+        assertEquals("2.234", fifth.room)
+        assertEquals("Zusammen", fifth.remark)
+    }
+
+    @Test
+    fun `KW 43 Wednesday 21 Oct 2026 has UES Pust then UES Lund`() {
+        // Layout (KW 43 Wed):
+        //   - 07:45-09:15 UES Püst 1.201 [rowspan=2]
+        //   - 09:45-11:15 UES Püst (carried)
+        //   - 11:45-13:15 UES Lund 3.204 (V) [rowspan=2]
+        //   - 13:45-15:15 UES Lund (carried)
+        val wednesday = dayOn(html, LocalDate.of(2026, 10, 21))
+        assertNotNull("Wednesday 2026-10-21 plan must exist", wednesday)
+        assertEquals(4, wednesday!!.slots.size)
+        val slots = wednesday.slots
+        // Slot 1: UES Püst 1.201
+        val first = slots[0].lessons.single()
+        assertEquals("UES", first.subject)
+        assertEquals("Püst", first.teacher)
+        assertEquals("1.201", first.room)
+        // Slot 2: UES Püst (carried)
+        val second = slots[1].lessons.single()
+        assertEquals("UES", second.subject)
+        assertEquals("Püst", second.teacher)
+        assertEquals("1.201", second.room)
+        // Slot 3: UES Lund 3.204
+        val third = slots[2].lessons.single()
+        assertEquals("UES", third.subject)
+        assertEquals("Lund", third.teacher)
+        assertEquals("3.204", third.room)
+        // Slot 4: UES Lund (carried)
+        val fourth = slots[3].lessons.single()
+        assertEquals("UES", fourth.subject)
+        assertEquals("Lund", fourth.teacher)
+        assertEquals("3.204", fourth.room)
+    }
+
+    @Test
+    fun `KW 43 Thursday 22 Oct 2026 has DVS Haenel then UES Pust 2_234 and 3_104`() {
+        // Layout (KW 43 Thu):
+        //   - 07:45-09:15 DVS Hänel 2.119 (L) [rowspan=2]
+        //   - 09:45-11:15 DVS Hänel (carried)
+        //   - 11:45-13:15 UES Püst 2.234 (V) (Zusammen) [rowspan=2]
+        //   - 13:45-15:15 UES Püst 2.234 (carried)
+        //   - 15:30-17:00 UES Püst 3.104 (V) (Zusammen) [rowspan=1]
+        // The original parser bug dropped the row-5 UES Püst 3.104 slot
+        // because the row's `<td>` list contained extra empty placeholders
+        // for Tue/Fri (carried) between the real Mon/Wed/Thu cells, and the
+        // cellIdx counter advanced past the real Thursday cell.
+        val thursday = dayOn(html, LocalDate.of(2026, 10, 22))
+        assertNotNull("Thursday 2026-10-22 plan must exist", thursday)
+        assertEquals(5, thursday!!.slots.size)
+        val slots = thursday.slots
+        // Slot 1: DVS Hänel 2.119
+        val first = slots[0].lessons.single()
+        assertEquals("DVS", first.subject)
+        assertEquals("Hänel", first.teacher)
+        assertEquals("2.119", first.room)
+        // Slot 2: DVS Hänel (carried)
+        val second = slots[1].lessons.single()
+        assertEquals("DVS", second.subject)
+        assertEquals("Hänel", second.teacher)
+        assertEquals("2.119", second.room)
+        // Slot 3: UES Püst 2.234 Zusammen
+        val third = slots[2].lessons.single()
+        assertEquals("UES", third.subject)
+        assertEquals("Püst", third.teacher)
+        assertEquals("2.234", third.room)
+        assertEquals("Zusammen", third.remark)
+        // Slot 4: UES Püst 2.234 (carried)
+        val fourth = slots[3].lessons.single()
+        assertEquals("UES", fourth.subject)
+        assertEquals("Püst", fourth.teacher)
+        assertEquals("2.234", fourth.room)
+        assertEquals("Zusammen", fourth.remark)
+        // Slot 5: UES Püst 3.104 Zusammen (the slot the old parser dropped)
+        val fifth = slots[4]
+        assertEquals(LocalTime.of(15, 30), fifth.start)
+        assertEquals(LocalTime.of(17, 0), fifth.end)
+        val fifthLesson = fifth.lessons.single()
+        assertEquals("UES", fifthLesson.subject)
+        assertEquals("Püst", fifthLesson.teacher)
+        assertEquals("3.104", fifthLesson.room)
+        assertEquals("Zusammen", fifthLesson.remark)
+    }
+
+    @Test
+    fun `KW 43 Friday 23 Oct 2026 has DSDS Lund across three rows`() {
+        // Layout (KW 43 Fri):
+        //   - 11:45-13:15 DSDS Lund 2.234 (V) [rowspan=3]
+        //   - 13:45-15:15 DSDS Lund (carried)
+        //   - 15:30-17:00 DSDS Lund (carried)
+        val friday = dayOn(html, LocalDate.of(2026, 10, 23))
+        assertNotNull("Friday 2026-10-23 plan must exist", friday)
+        assertEquals(3, friday!!.slots.size)
+        val starts = friday.slots.map { it.start }
+        assertEquals(
+            listOf(
+                LocalTime.of(11, 45),
+                LocalTime.of(13, 45),
+                LocalTime.of(15, 30),
+            ),
+            starts,
+        )
+        val lessons = friday.slots.map { it.lessons.single() }
+        lessons.forEach {
+            assertEquals("DSDS", it.subject)
+            assertEquals("Lund", it.teacher)
+            assertEquals("2.234", it.room)
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // helpers
     // -----------------------------------------------------------------------
 
