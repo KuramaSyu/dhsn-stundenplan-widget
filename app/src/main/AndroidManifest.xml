@@ -21,11 +21,24 @@
 
         <!-- Launcher activity: opens the in-app vertical timeline view of
              the stundenplan. This is the activity the device launches when
-             the user taps the app icon in the launcher / drawer. -->
+             the user taps the app icon in the launcher / drawer.
+
+             `android:label=""` suppresses the action-bar title that
+             Android would otherwise pick up from the application-level
+             `android:label` (no in-app heading is desired; the in-app
+             surface already shows KW + date range + nav + refresh +
+             overflow in its own header).
+
+             The `NoActionBar` theme variant removes the action bar
+             entirely so it doesn't take up vertical space — the activity
+             uses Compose's [AppTheme][de.dhsn.stundenplan.ui.AppTheme]
+             for its visual styling.
+        -->
         <activity
             android:name=".config.TimelineActivity"
             android:exported="true"
-            android:label="@string/app_name">
+            android:label=""
+            android:theme="@android:style/Theme.Material.Light.NoActionBar">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

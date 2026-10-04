@@ -2,7 +2,6 @@ package de.dhsn.stundenplan.ui
 
 import android.os.Build
 import android.util.Log
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
@@ -11,8 +10,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.IntrinsicSize
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -20,21 +17,28 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
@@ -43,13 +47,16 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathFillType
 import androidx.compose.ui.graphics.SolidColor
@@ -58,8 +65,10 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.path
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import de.dhsn.stundenplan.data.DayPlan
@@ -72,6 +81,7 @@ import java.time.Duration
 import java.time.LocalDate
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
+import java.time.temporal.ChronoUnit
 import java.time.temporal.WeekFields
 import java.util.Locale
 
@@ -98,13 +108,40 @@ fun TimelineScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
+    // On Sunday we want to open the app already on the UPCOMING week
+    // (KW 41 instead of KW 40), so the user immediately sees the
+    // next school day. The auto-skip handles "current week is empty"
+    // but doesn't apply here because on Sunday the current week still
+    // has Mon–Fri content from last week — the user just wants to look
+    // forward. We use a remember block so the decision is made once at
+    // composition (opening the app is when the rule matters most).
+    val initialWeekOffset = remember {
+        if (LocalDate.now().dayOfWeek == DayOfWeek.SUNDAY) 1 else 0
+    }
     // Always start on "this week" — [initialMonday] is only useful for
     // previews/tests.
-    var weekOffset by remember { mutableStateOf(0) }
+    var weekOffset by remember { mutableStateOf(initialWeekOffset) }
     var days by remember { mutableStateOf<List<DayPlan>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
+
+    // Settings (3-dot) dialog state. The dialog edits the seminargruppe
+    // used by the in-app screen (TimelineActivity passes
+    // appWidgetId = null, so the repository falls back to the global
+    // classId stored in DataStore via saveGlobalClassId / readGlobalClassId).
+    var showSettings by remember { mutableStateOf(false) }
+    var globalClassId by remember {
+        mutableStateOf(TimetableRepository.DEFAULT_CLASS_ID)
+    }
+    LaunchedEffect(showSettings) {
+        // Re-read whenever the dialog opens so a setting changed in
+        // another process / activity (WidgetConfigActivity) shows up.
+        if (showSettings) {
+            globalClassId = TimetableRepository.readGlobalClassId(context)
+                ?: TimetableRepository.DEFAULT_CLASS_ID
+        }
+    }
 
     val mondayOfThisWeek = remember {
         LocalDate.now().with(WeekFields.of(Locale.GERMAN).firstDayOfWeek)
@@ -159,6 +196,75 @@ fun TimelineScreen(
         }
     }
 
+    // LazyColumn state shared between the list and the "Heute" action.
+    // The header bumps [scrollToTodayTrigger] when the user taps the
+    // today button; the LaunchedEffect below runs once per bump and
+    // scrolls today's row into view.
+    //
+    // We do NOT reset the trigger inside the effect — doing so would
+    // re-key this LaunchedEffect and cancel the in-flight
+    // `animateScrollToItem` coroutine before it finishes, leaving the
+    // scroll stuck at its start position. The trigger stays at its
+    // last value between taps; the next bump (1→2, 2→3, …) re-fires
+    // the effect because the key changes.
+    val listState = rememberLazyListState()
+    var scrollToTodayTrigger by remember { mutableIntStateOf(0) }
+
+    // "Effective today" — the date the timeline treats as today for
+    // highlighting and scroll-targeting. Always equal to actual today;
+    // we deliberately do NOT override it on Sunday to "next Monday".
+    // The next-Monday highlight on Sunday is expressed through the
+    // `Morgen` label (see `isTomorrow` below), so the user sees
+    // "Morgen · Montag, 05.10." with the highlight instead of
+    // "Heute · Montag, 05.10." — which more accurately reflects that
+    // today is Sunday, not Monday.
+    var effectiveToday by remember { mutableStateOf(LocalDate.now()) }
+    LaunchedEffect(days) {
+        // Re-read actual today whenever the data reloads (e.g. after a
+        // refresh or week navigation) so a long-running app stays in
+        // sync with the user's clock.
+        effectiveToday = LocalDate.now()
+    }
+
+    // The week the Heute button should land in. Determined purely by
+    // actual today, NOT by what's currently loaded — the user might
+    // have navigated to a future week, but the today button should
+    // always return them to the highlighted day.
+    //
+    //   * Mon–Fri: current week (weekOffset = 0) — "Heute" is today.
+    //   * Sat–Sun: next week (weekOffset = +1) — "Morgen" is next
+    //     Monday, which lives in the upcoming week.
+    //
+    // When the user taps Heute we set `weekOffset` to this value; the
+    // data reloads; then the scroll-to-today effect below finds the
+    // highlighted day in the freshly-loaded [days] list.
+    val todayButtonWeekOffset: Int = remember(effectiveToday) {
+        computeTodayButtonWeekOffset(effectiveToday)
+    }
+
+    LaunchedEffect(scrollToTodayTrigger, days) {
+        if (scrollToTodayTrigger == 0) return@LaunchedEffect
+        if (days.isEmpty() || isLoading) return@LaunchedEffect
+        // Find the highlighted day in [days]: "Heute" wins over
+        // "Morgen", and "Morgen" wins over index 0. The rule mirrors
+        // what the user actually sees on screen.
+        val todayIndex = days.indexOfFirst {
+            it.date == effectiveToday && it.slots.isNotEmpty()
+        }
+        val tomorrowIndex = if (todayIndex < 0) {
+            days.indexOfFirst {
+                it.date == effectiveToday.plusDays(1) &&
+                    it.slots.isNotEmpty()
+            }
+        } else -1
+        val targetIndex = when {
+            todayIndex >= 0 -> todayIndex
+            tomorrowIndex >= 0 -> tomorrowIndex
+            else -> 0
+        }
+        listState.animateScrollToItem(targetIndex)
+    }
+
     Scaffold(
         snackbarHost = { SnackbarHost(snackbarHostState) },
         containerColor = MaterialTheme.colorScheme.background,
@@ -170,19 +276,30 @@ fun TimelineScreen(
         ) {
             TimelineHeader(
                 displayMonday = displayMonday,
-                weekOffset = weekOffset,
-                isCurrentWeek = weekOffset == 0,
                 isLoading = isLoading,
                 canGoBack = weekOffset > -WEEK_LIMIT,
                 canGoForward = weekOffset < WEEK_LIMIT,
                 onPrev = { weekOffset-- },
                 onNext = { weekOffset++ },
                 onToday = {
-                    weekOffset = 0
-                    // Re-trigger the auto-skip check so it runs even if
-                    // the weekOffset change alone wouldn't re-fire the
-                    // LaunchedEffect (because `days` is unchanged).
-                    autoSkipTrigger.value++
+                    // Jump to the week that contains the highlighted
+                    // day. Computed from actual today alone (not from
+                    // the currently-loaded list) so the user is always
+                    // returned to the right week, even after they've
+                    // navigated to a different one.
+                    if (weekOffset != todayButtonWeekOffset) {
+                        weekOffset = todayButtonWeekOffset
+                        // Re-trigger the auto-skip check so it runs
+                        // even if the weekOffset change alone wouldn't
+                        // re-fire the LaunchedEffect (because `days`
+                        // is unchanged).
+                        autoSkipTrigger.value++
+                    }
+                    // Always scroll the highlighted row into view. The
+                    // LaunchedEffect above ignores this trigger while
+                    // `days` is empty / loading, so it harmlessly
+                    // fires both for same-week and cross-week taps.
+                    scrollToTodayTrigger++
                 },
                 onRefresh = {
                     scope.launch {
@@ -212,6 +329,7 @@ fun TimelineScreen(
                         }
                     }
                 },
+                onOpenSettings = { showSettings = true },
             )
 
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
@@ -224,7 +342,33 @@ fun TimelineScreen(
                     CircularProgressIndicator()
                 }
             } else {
-                TimelineList(days = days, displayMonday = displayMonday)
+                TimelineList(
+                    days = days,
+                    displayMonday = displayMonday,
+                    listState = listState,
+                    effectiveToday = effectiveToday,
+                )
+            }
+
+            if (showSettings) {
+                SettingsDialog(
+                    currentClassId = globalClassId,
+                    onDismiss = { showSettings = false },
+                    onSave = { newId ->
+                        scope.launch {
+                            TimetableRepository.saveGlobalClassId(
+                                context = context,
+                                classId = newId,
+                            )
+                            globalClassId = newId
+                            // Reset to "this week" so the freshly-picked
+                            // seminargruppe loads immediately.
+                            weekOffset = 0
+                            autoSkipTrigger.value++
+                            showSettings = false
+                        }
+                    },
+                )
             }
         }
     }
@@ -237,8 +381,6 @@ fun TimelineScreen(
 @Composable
 private fun TimelineHeader(
     displayMonday: LocalDate,
-    weekOffset: Int,
-    isCurrentWeek: Boolean,
     isLoading: Boolean,
     canGoBack: Boolean,
     canGoForward: Boolean,
@@ -246,93 +388,206 @@ private fun TimelineHeader(
     onNext: () -> Unit,
     onToday: () -> Unit,
     onRefresh: () -> Unit,
+    onOpenSettings: () -> Unit,
 ) {
     val sunday = displayMonday.plusDays(4)
     val formatter = DateTimeFormatter.ofPattern("dd.MM.yyyy", Locale.GERMAN)
     val weekNumber = displayMonday.get(
         WeekFields.of(Locale.GERMAN).weekOfWeekBasedYear()
     )
+    // KW label and date range are now packed into a single row together
+    // with the navigation + refresh + overflow controls. The old "Diese
+    // Woche / Nächste Woche / Vorherige Woche" title line is gone: KW
+    // + the date range already convey the same information.
+    // Date range is rendered on TWO lines so the second date isn't
+    // truncated on narrow screens. The first line shows the Monday of
+    // the week, the second line shows "– <Friday>" indented to align.
+    val mondayLabel = displayMonday.format(formatter)
+    val fridayLabel = "– ${sunday.format(formatter)}"
+    val weekLabel = "KW $weekNumber"
 
-    // Relative label for the common cases (this/next/prev week), and a
-    // compact "KW X" for everything else. The full date range is only
-    // shown when the user has navigated away from "this week" so the
-    // current week doesn't waste vertical space on a range the user
-    // already knows.
-    val (title, showRange) = when (weekOffset) {
-        0 -> "Diese Woche" to false
-        1 -> "Nächste Woche" to true
-        -1 -> "Vorherige Woche" to true
-        else -> "KW $weekNumber" to true
-    }
-    val subtitle = if (showRange) {
-        "${displayMonday.format(formatter)} – ${sunday.format(formatter)}"
-    } else null
-
+    // The header uses `colorScheme.background` (same as the Scaffold's
+    // containerColor) and zero tonal elevation so it blends seamlessly
+    // with the area behind it and matches the system status-bar tint.
     Surface(
-        color = MaterialTheme.colorScheme.surface,
-        tonalElevation = 2.dp,
+        color = MaterialTheme.colorScheme.background,
+        tonalElevation = 0.dp,
     ) {
-        Column(
+        Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 8.dp),
+                .padding(horizontal = 8.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
+            // KW badge — the "selection" headline at the left edge.
             Text(
-                text = title,
-                style = MaterialTheme.typography.titleMedium,
+                text = weekLabel,
+                style = MaterialTheme.typography.titleSmall,
                 fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.padding(start = 4.dp, end = 8.dp),
             )
-            if (subtitle != null) {
+            // Two-line date column. We give the column a flexible width
+            // so it can grow on tablets but shrink on narrow phones.
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(end = 4.dp),
+            ) {
                 Text(
-                    text = subtitle,
+                    text = mondayLabel,
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(bottom = 4.dp),
+                    maxLines = 1,
+                )
+                Text(
+                    text = fridayLabel,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                )
+            }
+            IconButton(onClick = onPrev, enabled = canGoBack) {
+                Icon(
+                    imageVector = NavIcons.ChevronLeft,
+                    contentDescription = "Vorherige Woche",
+                )
+            }
+            // Today button: always enabled (within the current week it
+            // scrolls today's row into view; from another week it also
+            // resets the offset to 0). Tinted with `colorScheme.primary`
+            // so it stands out from the surrounding neutral icons —
+            // same accent colour the day-header uses for its "Heute"
+            // label, giving the screen a single visual "primary" cue.
+            IconButton(
+                onClick = onToday,
+                colors = IconButtonDefaults.iconButtonColors(
+                    contentColor = MaterialTheme.colorScheme.primary,
+                ),
+            ) {
+                Icon(
+                    imageVector = NavIcons.Today,
+                    contentDescription = "Heute",
+                )
+            }
+            IconButton(onClick = onNext, enabled = canGoForward) {
+                Icon(
+                    imageVector = NavIcons.ChevronRight,
+                    contentDescription = "Nächste Woche",
+                )
+            }
+            if (isLoading) {
+                CircularProgressIndicator(
+                    modifier = Modifier
+                        .size(20.dp)
+                        .padding(horizontal = 4.dp),
+                    strokeWidth = 2.dp,
                 )
             } else {
-                Spacer(modifier = Modifier.height(4.dp))
-            }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = onPrev, enabled = canGoBack) {
-                        Icon(
-                            imageVector = NavIcons.ChevronLeft,
-                            contentDescription = "Vorherige Woche",
-                        )
-                    }
-                    IconButton(onClick = onToday, enabled = !isCurrentWeek) {
-                        Icon(
-                            imageVector = NavIcons.Today,
-                            contentDescription = "Heute",
-                        )
-                    }
-                    IconButton(onClick = onNext, enabled = canGoForward) {
-                        Icon(
-                            imageVector = NavIcons.ChevronRight,
-                            contentDescription = "Nächste Woche",
-                        )
-                    }
-                }
-                if (isLoading) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(20.dp),
-                        strokeWidth = 2.dp,
+                IconButton(onClick = onRefresh) {
+                    Icon(
+                        imageVector = NavIcons.Refresh,
+                        contentDescription = "Aktualisieren",
                     )
-                } else {
-                    IconButton(onClick = onRefresh) {
-                        Icon(
-                            imageVector = NavIcons.Refresh,
-                            contentDescription = "Aktualisieren",
-                        )
-                    }
                 }
+            }
+            IconButton(onClick = onOpenSettings) {
+                Icon(
+                    imageVector = NavIcons.MoreVert,
+                    contentDescription = "Einstellungen",
+                )
             }
         }
     }
+}
+
+/**
+ * The overflow (3-dot) menu rendered as an [AlertDialog]. Lets the user
+ * change the seminargruppe used by the in-app viewer
+ * (TimelineActivity calls the repository with no widget id, which
+ * resolves to the global classId set here).
+ */
+@Composable
+private fun SettingsDialog(
+    currentClassId: String,
+    onDismiss: () -> Unit,
+    onSave: (String) -> Unit,
+) {
+    // Local mirror of the input so the text field shows what the user is
+    // typing immediately. We push the trimmed value back through [onSave]
+    // on confirm; if the user backs out we discard.
+    var draft by remember(currentClassId) { mutableStateOf(currentClassId) }
+    var error by remember(currentClassId) { mutableStateOf<String?>(null) }
+    val focusRequester = remember(currentClassId) { FocusRequester() }
+    LaunchedEffect(currentClassId) {
+        focusRequester.requestFocus()
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Einstellungen") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = "Seminargruppe",
+                    style = MaterialTheme.typography.titleSmall,
+                )
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = {
+                        draft = it
+                        error = null
+                    },
+                    label = { Text("z. B. 3it24-1") },
+                    placeholder = { Text(TimetableRepository.DEFAULT_CLASS_ID) },
+                    singleLine = true,
+                    isError = error != null,
+                    supportingText = error?.let { { Text(it) } },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .focusRequester(focusRequester),
+                    keyboardOptions = KeyboardOptions(
+                        capitalization = KeyboardCapitalization.None,
+                        keyboardType = KeyboardType.Ascii,
+                        imeAction = ImeAction.Done,
+                    ),
+                    keyboardActions = KeyboardActions(
+                        onDone = {
+                            val trimmed = draft.trim()
+                            if (trimmed.isEmpty()) {
+                                error = "Bitte etwas eingeben"
+                            } else {
+                                onSave(trimmed)
+                            }
+                        },
+                    ),
+                )
+                Text(
+                    text = "Gilt für die in-app Ansicht. Die Seminargruppe " +
+                        "eines Widgets wird separat in den Widget-" +
+                        "Einstellungen festgelegt.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                val trimmed = draft.trim()
+                if (trimmed.isEmpty()) {
+                    error = "Bitte etwas eingeben"
+                } else {
+                    onSave(trimmed)
+                }
+            }) {
+                Text("Speichern")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Abbrechen")
+            }
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -340,17 +595,33 @@ private fun TimelineHeader(
 // ---------------------------------------------------------------------------
 
 @Composable
-private fun TimelineList(days: List<DayPlan>, displayMonday: LocalDate) {
-    val today = LocalDate.now()
+private fun TimelineList(
+    days: List<DayPlan>,
+    displayMonday: LocalDate,
+    listState: LazyListState,
+    effectiveToday: LocalDate,
+) {
     LazyColumn(
+        state = listState,
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(12.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         items(days, key = { it.date.toEpochDay() }) { day ->
+            // "Tomorrow" is the calendar day after effectiveToday, but
+            // only labelled as such when that day actually has lessons.
+            // On Sunday this means the upcoming Monday gets the label
+            // (since Monday is in the loaded Mon–Fri list and has
+            // slots), while on weekdays the label still flags the
+            // next school day. Days that are calendar-tomorrow but
+            // have no slots (e.g. a holiday Wed) deliberately don't
+            // get the highlight, which keeps "Morgen" meaningful as
+            // "next day with something on it".
             DaySection(
                 day = day,
-                isToday = day.date == today,
+                isToday = day.date == effectiveToday,
+                isTomorrow = day.date == effectiveToday.plusDays(1)
+                    && day.slots.isNotEmpty(),
             )
         }
     }
@@ -360,9 +631,10 @@ private fun TimelineList(days: List<DayPlan>, displayMonday: LocalDate) {
 private fun DaySection(
     day: DayPlan,
     isToday: Boolean,
+    isTomorrow: Boolean = false,
 ) {
     Column(modifier = Modifier.fillMaxWidth()) {
-        DayHeader(day = day, isToday = isToday)
+        DayHeader(day = day, isToday = isToday, isTomorrow = isTomorrow)
         Spacer(modifier = Modifier.height(8.dp))
         if (day.slots.isEmpty()) {
             EmptyDayCard(date = day.date)
@@ -373,20 +645,34 @@ private fun DaySection(
 }
 
 @Composable
-private fun DayHeader(day: DayPlan, isToday: Boolean) {
+private fun DayHeader(
+    day: DayPlan,
+    isToday: Boolean,
+    isTomorrow: Boolean = false,
+) {
     val formatter = DateTimeFormatter.ofPattern("EEEE, dd.MM.", Locale.GERMAN)
     val label = day.date.format(formatter)
+    // Both "Heute" and "Morgen" get the primary tint so the next two
+    // days stand out from the rest of the week in the same visual
+    // language. `isToday` wins when both somehow match (it can't, but
+    // the order keeps the intent explicit).
+    val highlighted = isToday || isTomorrow
+    val prefix = when {
+        isToday -> "Heute"
+        isTomorrow -> "Morgen"
+        else -> null
+    }
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
         Text(
-            text = if (isToday) "Heute · $label"
+            text = if (prefix != null) "$prefix · $label"
                    else label.replaceFirstChar { it.uppercase(Locale.GERMAN) },
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.SemiBold,
-            color = if (isToday) MaterialTheme.colorScheme.primary
+            color = if (highlighted) MaterialTheme.colorScheme.primary
                     else MaterialTheme.colorScheme.onBackground,
         )
         Text(
@@ -627,62 +913,37 @@ private fun splitIntoBlocks(
 private const val BLOCK_MINUTES = 90L
 
 /**
- * The whole-day column: rail-with-dots on the left, lesson cards on
- * the right.
+ * Compute the `weekOffset` (relative to "this week") that the Heute
+ * button should land in.
  *
- * The rail is drawn with `drawBehind` so it spans the full height of
- * the content column on the right without gaps. Dots are placed on the
- * rail at the vertical offset of the matching card using
- * `Modifier.layout { marker{ … } }` so they line up pixel-perfect.
+ *   * Mon–Fri → current week (offset = 0). The highlighted "Heute" is
+ *     today, which is in the current week.
+ *   * Sat–Sun → next week (offset = +1). Today is in the weekend and
+ *     not in the loaded Mon–Fri list; the highlighted "Morgen" is
+ *     next Monday, which lives in the upcoming week.
  *
- * Deduplication: parallel lessons share one start time and, so we
- * render exactly **one** dot per unique `start` value. Each parallel
- * card still gets its own time-label in the gutter, just without a
- * second dot.
+ * The function is independent of the currently-loaded `days` list —
+ * it derives purely from the calendar — so the user is always
+ * returned to the right week even after navigating to a different one.
+ */
+private fun computeTodayButtonWeekOffset(today: LocalDate): Int = when (today.dayOfWeek) {
+    DayOfWeek.SATURDAY, DayOfWeek.SUNDAY -> 1
+    else -> 0
+}
+
+/**
+ * The whole-day column. Each [BlockGroup] becomes one row: a "Pause
+ * Xmin" label is inserted between rows when there's a gap, otherwise
+ * the rows stack directly.
  *
- * Pause labels are inserted between rows when there's a gap.
+ * The previous design used a left rail with dots aligned to each
+ * card's start time. We dropped the rail because the start time is
+ * already shown inside each card, and the rail consumed ~72 dp of
+ * horizontal space on phones for no information gain.
  */
 @Composable
 private fun TimelineColumn(groups: List<BlockGroup>) {
-    // Pre-compute the set of "first-occurrence" start times – those
-    // are the moments that should get a dot on the rail.
-    val firstStartTimes = remember(groups) {
-        val seen = mutableSetOf<LocalTime>()
-        groups.map { group ->
-            val isFirst = seen.add(group.start)
-            group.start to isFirst
-        }
-    }
-
-    // Single outer Column with the rail line drawn behind every child.
-    // Each [TimelineRow] is a Row that internally has its own gutter +
-    // content slot, so the dot is always aligned with its lesson card.
-    val railColor = MaterialTheme.colorScheme.outline
-    val dotColor = MaterialTheme.colorScheme.primary
-    val secondaryLabelColor = MaterialTheme.colorScheme.onSurfaceVariant
-    val railWidthPx = with(LocalDensity.current) { 2.dp.toPx() }
-    val railLeftPx = with(LocalDensity.current) { 36.dp.toPx() }
-    val railTopOffsetPx = with(LocalDensity.current) { 8.dp.toPx() }
-
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(end = 12.dp, bottom = 12.dp)
-            .drawBehind {
-                drawLine(
-                    color = railColor,
-                    start = androidx.compose.ui.geometry.Offset(
-                        x = railLeftPx,
-                        y = railTopOffsetPx,
-                    ),
-                    end = androidx.compose.ui.geometry.Offset(
-                        x = railLeftPx,
-                        y = size.height,
-                    ),
-                    strokeWidth = railWidthPx,
-                )
-            },
-    ) {
+    Column(modifier = Modifier.fillMaxWidth().padding(end = 12.dp, bottom = 12.dp)) {
         groups.forEachIndexed { index, group ->
             val previousEnd = groups.getOrNull(index - 1)?.end
             val previousStart = groups.getOrNull(index - 1)?.start
@@ -693,72 +954,8 @@ private fun TimelineColumn(groups: List<BlockGroup>) {
                 previousEnd != null &&
                 group.start.isAfter(previousEnd)
             ) {
-                // Pause label spans the full row width so the rail
-                // line passes through the empty space above the next
-                // dot.
                 PauseLabel(from = previousEnd, to = group.start)
             }
-            TimelineRow(
-                group = group,
-                showDot = firstStartTimes[index].second,
-                dotColor = dotColor,
-                secondaryLabelColor = secondaryLabelColor,
-            )
-        }
-    }
-}
-
-/**
- * One timeline row: a 72-dp gutter on the left (with the time-label
- * and a centered dot, sitting on the rail line drawn behind the outer
- * Column) and the lesson card on the right.
- */
-@Composable
-private fun TimelineRow(
-    group: BlockGroup,
-    showDot: Boolean,
-    dotColor: Color,
-    secondaryLabelColor: Color,
-) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.Top,
-    ) {
-        // Gutter slot: 72 dp wide so the text + dot don't touch the
-        // rail line drawn at x = 36 dp by the outer Column's
-        // drawBehind.
-        Column(
-            modifier = Modifier
-                .width(72.dp)
-                .padding(top = 8.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Text(
-                text = group.start.format(
-                    DateTimeFormatter.ofPattern("HH:mm", Locale.GERMAN)
-                ),
-                style = MaterialTheme.typography.labelSmall,
-                fontWeight = FontWeight.SemiBold,
-                color = if (showDot) dotColor else secondaryLabelColor,
-            )
-            Spacer(modifier = Modifier.height(6.dp))
-            if (showDot) {
-                Box(
-                    modifier = Modifier
-                        .size(12.dp)
-                        .background(dotColor, CircleShape),
-                )
-            } else {
-                // Reserve the same vertical slot for parallel rows so
-                // the dot on the rail above doesn't move when a
-                // second card shares the same start time.
-                Spacer(modifier = Modifier.size(12.dp))
-            }
-        }
-        Spacer(modifier = Modifier.width(8.dp))
-        // Content: the lesson card (single column if one lesson,
-        // side-by-side columns if there are parallel modules).
-        Column(modifier = Modifier.fillMaxWidth()) {
             LessonCard(group = group)
         }
     }
@@ -776,36 +973,56 @@ private fun PauseLabel(from: LocalTime, to: LocalTime) {
         }
         else -> "Pause ${minutes}min"
     }
-    Row(
+    // Just the label centered on the row — no more 72 dp gutter spacer,
+    // because the rail was removed.
+    Text(
+        text = label,
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 4.dp),
-        verticalAlignment = Alignment.Top,
-    ) {
-        // 72-dp spacer matches the gutter so the label aligns with the
-        // lesson cards on the right.
-        Spacer(modifier = Modifier.width(72.dp))
-        Spacer(modifier = Modifier.width(8.dp))
-        Text(
-            text = label,
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(start = 4.dp, top = 4.dp, bottom = 4.dp),
-        )
-    }
+        textAlign = TextAlign.Center,
+    )
 }
 
+/**
+ * One lesson card. Shows, top to bottom:
+ *
+ *   - **Time row**: a clock icon + the visible 90-min time range, with
+ *     an optional `(i)` button on the trailing edge.
+ *   - **Lesson body**: one or more [LessonColumn]s (side-by-side for
+ *     parallel modules). Each column renders subject, then an info row
+ *     with teacher and room as `AssistChip`s followed by `kind` and
+ *     `remark` separated by middle dots.
+ *
+ * The `(i)` disclosure appears only on the **first** 90-min chunk of a
+ * lesson whose original end differs from the visible end — i.e. a
+ * lesson that was emitted as multiple `rowspan`-merged slots by the BA
+ * page parser. Tap-to-reveal shows `"Original: 7:45–13:15 · UES"`,
+ * giving the user the true time window the rowspans internally so the
+ * one-chunk-on-screen presentation isn't a surprise.
+ */
 @Composable
 private fun LessonCard(group: BlockGroup) {
-    val rangeLabel = "${group.start.format(
-        DateTimeFormatter.ofPattern("HH:mm", Locale.GERMAN)
-    )} – ${group.end.format(
-        DateTimeFormatter.ofPattern("HH:mm", Locale.GERMAN)
-    )}"
-    // Card-level disclosure: needed iff the visible end differs from
-    // ANY lesson's originalEnd in the group. For the (single-lesson)
-    // case this collapses to the old block.heuristic.
-    val isSplit = group.lessons.any { it.end != group.originalEnd }
+    val timeFmt = DateTimeFormatter.ofPattern("HH:mm", Locale.GERMAN)
+    val rangeLabel = "${group.start.format(timeFmt)} – ${group.end.format(timeFmt)}"
+
+    // Rowspan-aware disclosure: the (i) only appears on the LEADING
+    // 90-min chunk of a multi-chunk lesson. We identify the leading
+    // chunk by "this lesson's first slot (`lesson.start`) coincides
+    // with this chunk's start" AND we know it's actually a multi-chunk
+// lesson by "the merged-lesson end (`group.originalEnd`) is past the
+// visible chunk end (`group.end`).
+//
+// Note: `lesson.start` / `lesson.end` here are the very first slot's
+// times (the [Lesson] object stored in each [Block] is the original
+// one emitted by the scraper and is never rewritten when the merged
+// lesson is extended — only `tail.lessonEnd` on the [Merged] is
+// updated, and `originalEnd` reflects that updated end).
+val isSplitFirstChunk = group.lessons.any { lesson ->
+    lesson.start == group.start && group.originalEnd != group.end
+}
 
     // Local expand state for the original-time disclosure.
     var expanded by remember(group.start, group.end, group.originalEnd) {
@@ -822,23 +1039,28 @@ private fun LessonCard(group: BlockGroup) {
             )
             .padding(horizontal = 12.dp, vertical = 8.dp),
     ) {
-        // Card header: time range on the left, optional {i} disclosure
-        // on the right. (When the group has only one lesson, we keep
-        // the original single-line layout — but we always render the
-        // time at card level so the UI is consistent regardless of the
-        // number of parallel modules.)
+        // Card time row: clock icon + range, (i) disclosure trailing.
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
         ) {
-            Text(
-                text = rangeLabel,
-                style = MaterialTheme.typography.labelSmall,
-                fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.onSecondaryContainer,
-            )
-            if (isSplit) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = NavIcons.Schedule,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                    modifier = Modifier.size(16.dp),
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(
+                    text = rangeLabel,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                )
+            }
+            if (isSplitFirstChunk) {
                 IconButton(
                     onClick = { expanded = !expanded },
                     modifier = Modifier.size(24.dp),
@@ -857,9 +1079,11 @@ private fun LessonCard(group: BlockGroup) {
             }
         }
 
+        Spacer(modifier = Modifier.height(6.dp))
+
         // Body: one column per lesson (side-by-side when there are
-        // parallel modules), each showing subject / teacher / room /
-        // kind / remark.
+        // parallel modules). Each column shows subject, then the
+        // chip+separator info row.
         if (group.lessons.size == 1) {
             LessonColumn(lesson = group.lessons[0])
         } else {
@@ -876,20 +1100,16 @@ private fun LessonCard(group: BlockGroup) {
             }
         }
 
-        if (isSplit && expanded) {
+        if (isSplitFirstChunk && expanded) {
             Spacer(modifier = Modifier.height(4.dp))
+            // Build the disclosure text: "Original: 7:45–13:15 · UES"
+            // for each lesson in the leading chunk.
+            val subjectList = group.lessons.joinToString(" · ") { it.subject }
+            val timeRange = group.lessons.joinToString(" · ") { lesson ->
+                "${lesson.start.format(timeFmt)}–${lesson.end.format(timeFmt)}"
+            }
             Text(
-                text = "Original: ${
-                    group.lessons.joinToString(separator = " / ") { lesson ->
-                        "${lesson.start.format(
-                            DateTimeFormatter.ofPattern("HH:mm", Locale.GERMAN)
-                        )}–${
-                            lesson.end.format(
-                                DateTimeFormatter.ofPattern("HH:mm", Locale.GERMAN)
-                            )
-                        }"
-                    }
-                }",
+                text = "Original: $timeRange · $subjectList",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.85f),
             )
@@ -897,6 +1117,20 @@ private fun LessonCard(group: BlockGroup) {
     }
 }
 
+/**
+ * Renders the per-module body of a [LessonCard]. Layout, top-to-bottom:
+ *
+ *   1. **Subject** in title-small, bold.
+ *   2. **Chips row**: teacher (`Person` icon) and room (`DoorFront` icon)
+ *      as `AssistChip`s. Skipped silently when the field is blank.
+ *   3. **Tail row**: remaining info (`kind`, `remark`) joined by a
+ *      centered middle dot (` · `). NOT a chip, just plain text so the
+ *      chips above stay visually distinct from the descriptors.
+ *
+ * `kind` and `remark` are joined together with everything else that
+ * isn't a chip (so the last line is always exactly one line, not three
+ * one-word lines).
+ */
 @Composable
 private fun LessonColumn(
     lesson: Lesson,
@@ -909,35 +1143,89 @@ private fun LessonColumn(
             fontWeight = FontWeight.SemiBold,
             color = MaterialTheme.colorScheme.onSecondaryContainer,
         )
-        if (lesson.teacher.isNotBlank()) {
-            Text(
-                text = lesson.teacher,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSecondaryContainer,
-            )
+        Spacer(modifier = Modifier.height(4.dp))
+        // Chip row: teacher + room side-by-side.
+        if (lesson.teacher.isNotBlank() || lesson.room.isNotBlank()) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (lesson.teacher.isNotBlank()) {
+                    InfoChip(
+                        icon = NavIcons.Person,
+                        label = lesson.teacher,
+                    )
+                }
+                if (lesson.room.isNotBlank()) {
+                    InfoChip(
+                        icon = NavIcons.DoorFront,
+                        label = lesson.room,
+                    )
+                }
+            }
         }
-        if (lesson.room.isNotBlank()) {
-            Text(
-                text = "Raum ${lesson.room}",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSecondaryContainer,
-            )
+        // Tail row: everything else (kind, remark) as a single dot-
+        // separated line.
+        val tail = buildList {
+            if (lesson.kind.isNotBlank()) add(lesson.kind)
+            if (lesson.remark.isNotBlank()) add(lesson.remark)
         }
-        if (lesson.kind.isNotBlank()) {
-            Text(
-                text = lesson.kind,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.7f),
-            )
-        }
-        if (lesson.remark.isNotBlank()) {
+        if (tail.isNotEmpty()) {
             Spacer(modifier = Modifier.height(2.dp))
             Text(
-                text = lesson.remark,
+                text = tail.joinToString(" · "),
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.75f),
             )
         }
+    }
+}
+
+/**
+ * A compact, non-interactive info chip used inside a [LessonCard] to
+ * surface teacher + room at full color contrast.
+ *
+ * We don't use Material 3's `AssistChip` / `SuggestionChip` here
+ * because:
+ *
+ *   1. They default to 32 dp tall and a fully-rounded pill shape
+ *      (`RoundedCornerShape(16.dp)`), which is too prominent for an
+ *      inline label inside a card body.
+ *   2. Disabling them (which we have to do — these are pure labels,
+ *      not actions) applies a 0.38 alpha on top of whatever colors
+ *      we pass via `assistChipColors()`, so the chip text looks like
+ *      secondary content even though we want full opacity.
+ *
+ * This implementation gives us a ~24 dp tall, mildly rounded
+ * (4 dp corner radius) chip with full-opacity `onTertiaryContainer`
+ * text + icon on a `tertiaryContainer` background.
+ */
+@Composable
+private fun InfoChip(
+    icon: ImageVector,
+    label: String,
+) {
+    Row(
+        modifier = Modifier
+            .background(
+                color = MaterialTheme.colorScheme.tertiaryContainer,
+                shape = RoundedCornerShape(4.dp),
+            )
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onTertiaryContainer,
+            modifier = Modifier.size(14.dp),
+        )
+        Spacer(modifier = Modifier.width(4.dp))
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onTertiaryContainer,
+        )
     }
 }
 
@@ -1126,6 +1414,170 @@ private object NavIcons {
             curveTo(4f, 7.59f, 7.59f, 4f, 12f, 4f)
             curveTo(16.41f, 4f, 20f, 7.59f, 20f, 12f)
             curveTo(20f, 16.41f, 16.41f, 20f, 12f, 20f)
+            close()
+        }
+    }.build()
+
+    /**
+     * Round clock face with hour + minute hands. Material Symbols
+     * `schedule` glyph, rendered as two open paths so the hour/minute
+     * hands and the circular outline share one [ImageVector].
+     */
+    val Schedule: ImageVector = ImageVector.Builder(
+        name = "Schedule",
+        defaultWidth = 24.dp,
+        defaultHeight = 24.dp,
+        viewportWidth = 24f,
+        viewportHeight = 24f,
+    ).apply {
+        path(
+            fill = null,
+            stroke = SolidColor(Color.Black),
+            strokeLineWidth = 2f,
+            strokeLineCap = StrokeCap.Round,
+            strokeLineJoin = StrokeJoin.Round,
+        ) {
+            moveTo(12f, 6f)
+            verticalLineTo(12f)
+            lineTo(16f, 14f)
+        }
+        path(
+            fill = null,
+            stroke = SolidColor(Color.Black),
+            strokeLineWidth = 2f,
+            strokeLineCap = StrokeCap.Round,
+            strokeLineJoin = StrokeJoin.Round,
+        ) {
+            moveTo(21f, 12f)
+            curveTo(21f, 16.97f, 16.97f, 21f, 12f, 21f)
+            curveTo(7.03f, 21f, 3f, 16.97f, 3f, 12f)
+            curveTo(3f, 7.03f, 7.03f, 3f, 12f, 3f)
+            curveTo(16.97f, 3f, 21f, 7.03f, 21f, 12f)
+            close()
+        }
+    }.build()
+
+    /**
+     * Person silhouette: round head + tapered body. Material Symbols
+     * `person` glyph.
+     */
+    val Person: ImageVector = ImageVector.Builder(
+        name = "Person",
+        defaultWidth = 24.dp,
+        defaultHeight = 24.dp,
+        viewportWidth = 24f,
+        viewportHeight = 24f,
+    ).apply {
+        path(
+            fill = SolidColor(Color.Black),
+            fillAlpha = 1f,
+            stroke = null,
+            strokeLineWidth = 0f,
+            strokeLineCap = StrokeCap.Butt,
+            strokeLineJoin = StrokeJoin.Miter,
+            strokeLineMiter = 4f,
+            pathFillType = PathFillType.NonZero,
+        ) {
+            moveTo(12f, 12f)
+            curveTo(14.21f, 12f, 16f, 10.21f, 16f, 8f)
+            curveTo(16f, 5.79f, 14.21f, 4f, 12f, 4f)
+            curveTo(9.79f, 4f, 8f, 5.79f, 8f, 8f)
+            curveTo(8f, 10.21f, 9.79f, 12f, 12f, 12f)
+            close()
+            moveTo(12f, 14f)
+            curveTo(7.58f, 14f, 4f, 16.69f, 4f, 19f)
+            verticalLineTo(20f)
+            horizontalLineTo(20f)
+            verticalLineTo(19f)
+            curveTo(20f, 16.69f, 16.42f, 14f, 12f, 14f)
+            close()
+        }
+    }.build()
+
+    /**
+     * Door + frame. Material Symbols `door_front` glyph.
+     */
+    val DoorFront: ImageVector = ImageVector.Builder(
+        name = "DoorFront",
+        defaultWidth = 24.dp,
+        defaultHeight = 24.dp,
+        viewportWidth = 24f,
+        viewportHeight = 24f,
+    ).apply {
+        path(
+            fill = SolidColor(Color.Black),
+            fillAlpha = 1f,
+            stroke = null,
+            strokeLineWidth = 0f,
+            strokeLineCap = StrokeCap.Butt,
+            strokeLineJoin = StrokeJoin.Miter,
+            strokeLineMiter = 4f,
+            pathFillType = PathFillType.NonZero,
+        ) {
+            moveTo(19f, 19f)
+            verticalLineTo(5f)
+            curveTo(19f, 3.9f, 18.1f, 3f, 17f, 3f)
+            horizontalLineTo(7f)
+            curveTo(5.9f, 3f, 5f, 3.9f, 5f, 5f)
+            verticalLineTo(19f)
+            horizontalLineTo(3f)
+            verticalLineTo(21f)
+            horizontalLineTo(21f)
+            verticalLineTo(19f)
+            horizontalLineTo(19f)
+            close()
+            moveTo(17f, 19f)
+            horizontalLineTo(7f)
+            verticalLineTo(5f)
+            horizontalLineTo(17f)
+            verticalLineTo(19f)
+            close()
+            moveTo(14f, 11f)
+            verticalLineTo(13f)
+            horizontalLineTo(16f)
+            verticalLineTo(11f)
+            horizontalLineTo(14f)
+            close()
+        }
+    }.build()
+
+    /**
+     * Three vertical dots. Material Symbols `more_vert` glyph.
+     */
+    val MoreVert: ImageVector = ImageVector.Builder(
+        name = "MoreVert",
+        defaultWidth = 24.dp,
+        defaultHeight = 24.dp,
+        viewportWidth = 24f,
+        viewportHeight = 24f,
+    ).apply {
+        path(
+            fill = SolidColor(Color.Black),
+            fillAlpha = 1f,
+            stroke = null,
+            strokeLineWidth = 0f,
+            strokeLineCap = StrokeCap.Butt,
+            strokeLineJoin = StrokeJoin.Miter,
+            strokeLineMiter = 4f,
+            pathFillType = PathFillType.NonZero,
+        ) {
+            moveTo(12f, 8f)
+            curveTo(13.1f, 8f, 14f, 7.1f, 14f, 6f)
+            curveTo(14f, 4.9f, 13.1f, 4f, 12f, 4f)
+            curveTo(10.9f, 4f, 10f, 4.9f, 10f, 6f)
+            curveTo(10f, 7.1f, 10.9f, 8f, 12f, 8f)
+            close()
+            moveTo(12f, 14f)
+            curveTo(13.1f, 14f, 14f, 13.1f, 14f, 12f)
+            curveTo(14f, 10.9f, 13.1f, 10f, 12f, 10f)
+            curveTo(10.9f, 10f, 10f, 10.9f, 10f, 12f)
+            curveTo(10f, 13.1f, 10.9f, 14f, 12f, 14f)
+            close()
+            moveTo(12f, 20f)
+            curveTo(13.1f, 20f, 14f, 19.1f, 14f, 18f)
+            curveTo(14f, 16.9f, 13.1f, 16f, 12f, 16f)
+            curveTo(10.9f, 16f, 10f, 16.9f, 10f, 18f)
+            curveTo(10f, 19.1f, 10.9f, 20f, 12f, 20f)
             close()
         }
     }.build()

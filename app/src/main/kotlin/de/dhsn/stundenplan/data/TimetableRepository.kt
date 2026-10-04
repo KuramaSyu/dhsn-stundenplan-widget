@@ -396,7 +396,51 @@ object TimetableRepository {
     private suspend fun resolveClassId(context: Context, appWidgetId: Int?): String =
         appWidgetId?.let { id ->
             WidgetConfigStore(context).getClassId(id)
-        } ?: DEFAULT_CLASS_ID
+        } ?: readGlobalClassId(context) ?: DEFAULT_CLASS_ID
+
+    /**
+     * In-app class-id preference, used when [TimelineActivity] (which has
+     * no widget id) asks the repository for data. Stored in the same
+     * `widget_fetch` DataStore as a single string preference, separate
+     * from the per-widget entries so widget configuration continues to work
+     * exactly as before.
+     *
+     * Returns `null` when the user hasn't picked one yet, in which case
+     * [resolveClassId] falls back to [DEFAULT_CLASS_ID].
+     */
+    private val globalClassIdKey = stringPreferencesKey("global_class_id")
+
+    /** Persist the seminargruppe used by the in-app timeline viewer. */
+    suspend fun saveGlobalClassId(context: Context, classId: String) {
+        val trimmed = classId.trim()
+        if (trimmed.isEmpty()) return
+        try {
+            context.fetchDataStore.edit { prefs ->
+                prefs[globalClassIdKey] = trimmed
+            }
+            // Bust the cache so a subsequent read re-fetches under the
+            // new id even before the in-memory caches age out.
+            memoryCache.remove(trimmed)
+            weeksCache.remove(trimmed)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            Log.w(TAG, "saveGlobalClassId($trimmed) failed: ${e.message}")
+        }
+    }
+
+    suspend fun readGlobalClassId(context: Context): String? =
+        try {
+            context.fetchDataStore.data
+                .map { it[globalClassIdKey] }
+                .first()
+                ?.takeIf { it.isNotBlank() }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            Log.w(TAG, "readGlobalClassId() failed: ${e.message}")
+            null
+        }
 
     /**
      * In-memory cache: one entry per configured classId. Stores the slots
