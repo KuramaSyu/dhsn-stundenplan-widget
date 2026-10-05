@@ -27,18 +27,22 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
@@ -57,6 +61,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathFillType
 import androidx.compose.ui.graphics.SolidColor
@@ -71,6 +76,8 @@ import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import android.content.Intent
+import androidx.core.net.toUri
 import de.dhsn.stundenplan.data.DayPlan
 import de.dhsn.stundenplan.data.Lesson
 import de.dhsn.stundenplan.data.LessonSlot
@@ -94,12 +101,19 @@ import java.util.Locale
  * between.
  *
  * Navigation lives on top of the timeline:
- *   `[←] [Heute] [→]`   Wochen-Range   `[↻]`
+ *   `[←] [Heute] [→]`   Wochen-Range
+ *
+ * Pull-to-refresh at the top of the list handles refreshes, replacing
+ * the former `↻` button in the header.
  *
  * The internal weekOffset controls how many weeks away from "this week"
  * we are. 0 = current week, -1 = previous, +1 = next. Bounds are
  * ±[WEEK_LIMIT].
+ *
+ * PullToRefreshBox is gated by ExperimentalMaterial3Api, so the whole
+ * composable opts in.
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TimelineScreen(
     appWidgetId: Int? = null,
@@ -129,10 +143,19 @@ fun TimelineScreen(
     // Settings (3-dot) dialog state. The dialog edits the seminargruppe
     // used by the in-app screen (TimelineActivity passes
     // appWidgetId = null, so the repository falls back to the global
-    // classId stored in DataStore via saveGlobalClassId / readGlobalClassId).
+    // classId stored in DataStore via saveGlobalClassId / readGlobalClassId)
+    // AND exposes the optional per-module color toggle.
     var showSettings by remember { mutableStateOf(false) }
     var globalClassId by remember {
         mutableStateOf(TimetableRepository.DEFAULT_CLASS_ID)
+    }
+    // "Distinct color per module" toggle. Persisted in the same
+    // `widget_fetch` DataStore as the global class id because both are
+    // app-global preferences rather than per-widget settings. Default:
+    // off.
+    var moduleColorsEnabled by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        moduleColorsEnabled = TimetableRepository.readModuleColorsEnabled(context)
     }
     LaunchedEffect(showSettings) {
         // Re-read whenever the dialog opens so a setting changed in
@@ -140,8 +163,28 @@ fun TimelineScreen(
         if (showSettings) {
             globalClassId = TimetableRepository.readGlobalClassId(context)
                 ?: TimetableRepository.DEFAULT_CLASS_ID
+            moduleColorsEnabled =
+                TimetableRepository.readModuleColorsEnabled(context)
         }
     }
+
+    // User-triggered pull-to-refresh state. Separate from [isLoading]
+    // so the header's small [CircularProgressIndicator] keeps its own
+    // state machine for programmatic refreshes (e.g. triggered by the
+    // widget sync) while pull-to-refresh gets its own spinner-and-fade
+    // cycle. Both flows end up calling [TimetableRepository.refresh],
+    // so the on-screen result is the same; the split is purely so the
+    // indicators don't blink.
+    var userPullRefreshing by remember { mutableStateOf(false) }
+
+    // Validation-in-progress flag for the settings dialog "Speichern"
+// button. While true, the confirmButton is disabled and shows a
+    // spinner so the user can't double-tap while we're testing the
+    // entered seminargruppe against the BA server.
+    var isValidating by remember { mutableStateOf(false) }
+    // Last validation error, if any. Rendered as the OutlinedTextField
+    // `supportingText` so the user sees it inline next to the field.
+    var validationError by remember { mutableStateOf<String?>(null) }
 
     val mondayOfThisWeek = remember {
         LocalDate.now().with(WeekFields.of(Locale.GERMAN).firstDayOfWeek)
@@ -194,6 +237,24 @@ fun TimelineScreen(
             Log.i(TAG, "current week is empty, jumping to next week")
             weekOffset = 1
         }
+    }
+
+    // Helper used by the settings dialog's "Speichern" handler to
+    // commit the entered seminargruppe + module-colors toggle and
+    // close the dialog. Pulled out so the three "save succeeded"
+    // branches (Valid, Offline-after-save, ...) share one path.
+    // Declared after [autoSkipTrigger] because it touches
+    // `autoSkipTrigger.value` to re-fire the auto-skip LaunchedEffect.
+    suspend fun persistAndClose(trimmed: String, newModuleColors: Boolean) {
+        TimetableRepository.saveGlobalClassId(context = context, classId = trimmed)
+        TimetableRepository.saveModuleColorsEnabled(context = context, enabled = newModuleColors)
+        globalClassId = trimmed
+        moduleColorsEnabled = newModuleColors
+        // Reset to "this week" so the freshly-picked seminargruppe
+        // loads immediately.
+        weekOffset = 0
+        autoSkipTrigger.value++
+        showSettings = false
     }
 
     // LazyColumn state shared between the list and the "Heute" action.
@@ -301,71 +362,133 @@ fun TimelineScreen(
                     // fires both for same-week and cross-week taps.
                     scrollToTodayTrigger++
                 },
-                onRefresh = {
-                    scope.launch {
-                        isLoading = true
-                        // Wipe offset back to today before refresh so the
-                        // user sees a freshly-fetched "this week".
-                        weekOffset = 0
-                        autoSkipTrigger.value++
-                        try {
-                            TimetableRepository.refresh(context, appWidgetId)
-                            days = TimetableRepository.week(
-                                context = context,
-                                appWidgetId = appWidgetId,
-                                monday = LocalDate.now()
-                                    .with(WeekFields.of(Locale.GERMAN).firstDayOfWeek),
-                            )
-                        } catch (e: kotlinx.coroutines.CancellationException) {
-                            // User navigated away while refresh was in
-                            // flight - re-throw so the launched coroutine
-                            // actually exits.
-                            throw e
-                        } catch (e: Throwable) {
-                            errorMessage = "Aktualisieren fehlgeschlagen: " +
-                                (e.message ?: e.javaClass.simpleName)
-                        } finally {
-                            isLoading = false
-                        }
-                    }
-                },
                 onOpenSettings = { showSettings = true },
             )
 
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
 
             if (isLoading && days.isEmpty()) {
+                // weight(1f) keeps the spinner centred while leaving
+                // room for the CreditsFooter below. Without it, the
+                // spinner stretches to fill the whole parent and the
+                // footer gets zero vertical space.
                 Box(
-                    modifier = Modifier.fillMaxSize(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
                     contentAlignment = Alignment.Center,
                 ) {
                     CircularProgressIndicator()
                 }
             } else {
-                TimelineList(
-                    days = days,
-                    displayMonday = displayMonday,
-                    listState = listState,
-                    effectiveToday = effectiveToday,
-                )
+                // Wrap the timeline list in PullToRefreshBox so the
+                // user can drag down at the top to trigger a refresh.
+                // The box's default indicator is a rotating circle that
+                // always completes at least one full rotation — which
+                // is exactly the behaviour we want (no flicker on short
+                // fetches). We deliberately keep [isLoading] /
+                // [userPullRefreshing] separate so the header's small
+                // progress indicator doesn't mirror the pull-to-refresh
+                // spinner.
+                // weight(1f) makes the box take the remaining
+                // vertical space inside the Column, while leaving
+                // room below for the CreditsFooter. fillMaxSize()
+                // would otherwise stretch the box to consume the
+                // whole parent and squeeze the footer to zero height.
+                PullToRefreshBox(
+                    isRefreshing = userPullRefreshing,
+                    onRefresh = {
+                        if (userPullRefreshing) return@PullToRefreshBox
+                        scope.launch {
+                            userPullRefreshing = true
+                            try {
+                                weekOffset = 0
+                                autoSkipTrigger.value++
+                                TimetableRepository.refresh(context, appWidgetId)
+                                days = TimetableRepository.week(
+                                    context = context,
+                                    appWidgetId = appWidgetId,
+                                    monday = LocalDate.now()
+                                        .with(WeekFields.of(Locale.GERMAN).firstDayOfWeek),
+                                )
+                            } catch (e: kotlinx.coroutines.CancellationException) {
+                                throw e
+                            } catch (e: Throwable) {
+                                errorMessage = "Aktualisieren fehlgeschlagen: " +
+                                    (e.message ?: e.javaClass.simpleName)
+                            } finally {
+                                userPullRefreshing = false
+                            }
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                ) {
+                    TimelineList(
+                        days = days,
+                        displayMonday = displayMonday,
+                        listState = listState,
+                        effectiveToday = effectiveToday,
+                        moduleColorsEnabled = moduleColorsEnabled,
+                    )
+                }
             }
+
+            // No credits footer in the main app body — the maintenance
+            // notice lives inside the Settings dialog (see
+            // [SettingsDialog]) per design.
 
             if (showSettings) {
                 SettingsDialog(
                     currentClassId = globalClassId,
-                    onDismiss = { showSettings = false },
-                    onSave = { newId ->
+                    moduleColorsEnabled = moduleColorsEnabled,
+                    validationError = validationError,
+                    isValidating = isValidating,
+                    onDismiss = {
+                        // Don't close while we're mid-validate to avoid
+                        // leaving the dialog in a "saved?" indeterminate
+                        // state. The Abbrechen button is also gated
+                        // by [isValidating] so this only triggers when
+                        // the user taps outside the dialog.
+                        if (!isValidating) showSettings = false
+                    },
+                    onSave = { newId, newModuleColors ->
+                        val trimmed = newId.trim()
                         scope.launch {
-                            TimetableRepository.saveGlobalClassId(
-                                context = context,
-                                classId = newId,
-                            )
-                            globalClassId = newId
-                            // Reset to "this week" so the freshly-picked
-                            // seminargruppe loads immediately.
-                            weekOffset = 0
-                            autoSkipTrigger.value++
-                            showSettings = false
+                            isValidating = true
+                            validationError = null
+                            // Hit the BA server exactly once to make
+                            // sure the entered seminargruppe actually
+                            // returns a plan. We deliberately DON'T
+                            // write to [weeksCache] / [memoryCache]
+                            // here so a failed validation doesn't
+                            // corrupt the user's previously-saved
+                            // class id's cache.
+                            val result = TimetableRepository.validateClassId(trimmed)
+                            isValidating = false
+                            when (result) {
+                                is TimetableRepository.ValidationResult.Valid -> {
+                                    persistAndClose(
+                                        trimmed = trimmed,
+                                        newModuleColors = newModuleColors,
+                                    )
+                                }
+                                is TimetableRepository.ValidationResult.InvalidServerResponse -> {
+                                    validationError =
+                                        "Keine gültige Seminargruppe — Server lieferte keinen Stundenplan."
+                                }
+                                is TimetableRepository.ValidationResult.Offline -> {
+                                    // Offline / no network → accept the
+                                    // input anyway per product spec.
+                                    persistAndClose(
+                                        trimmed = trimmed,
+                                        newModuleColors = newModuleColors,
+                                    )
+                                    errorMessage =
+                                        "Seminargruppe gespeichert (offline — konnte URL nicht testen)."
+                                }
+                            }
                         }
                     },
                 )
@@ -387,7 +510,6 @@ private fun TimelineHeader(
     onPrev: () -> Unit,
     onNext: () -> Unit,
     onToday: () -> Unit,
-    onRefresh: () -> Unit,
     onOpenSettings: () -> Unit,
 ) {
     val sunday = displayMonday.plusDays(4)
@@ -475,6 +597,12 @@ private fun TimelineHeader(
                     contentDescription = "Nächste Woche",
                 )
             }
+            // The header used to show a ↻ icon here as a manual
+            // refresh button, but pull-to-refresh makes that
+            // redundant. We still surface [isLoading] with a small
+            // spinner so the user gets feedback while a programmatic
+            // refresh (e.g. triggered by the widget sync) is in
+            // flight.
             if (isLoading) {
                 CircularProgressIndicator(
                     modifier = Modifier
@@ -482,13 +610,6 @@ private fun TimelineHeader(
                         .padding(horizontal = 4.dp),
                     strokeWidth = 2.dp,
                 )
-            } else {
-                IconButton(onClick = onRefresh) {
-                    Icon(
-                        imageVector = NavIcons.Refresh,
-                        contentDescription = "Aktualisieren",
-                    )
-                }
             }
             IconButton(onClick = onOpenSettings) {
                 Icon(
@@ -501,26 +622,48 @@ private fun TimelineHeader(
 }
 
 /**
- * The overflow (3-dot) menu rendered as an [AlertDialog]. Lets the user
- * change the seminargruppe used by the in-app viewer
- * (TimelineActivity calls the repository with no widget id, which
- * resolves to the global classId set here).
+ * The overflow (3-dot) menu rendered as an [AlertDialog]. Lets the user:
+ *
+ *   - Edit the seminargruppe used by the in-app viewer. The entered
+ *     id is validated against the BA-Dresden PlanServlet on save; if
+ *     the server returns a usable plan the new id is persisted, if it
+ *     returns garbage the user sees an inline error, if the device is
+ *     offline the input is accepted anyway (per product spec).
+ *   - Toggle the optional per-module accent-color feature.
+ *
+ * The dialog also surfaces a small maintenance notice ("Ungewartet
+ * ab 04/2027") and a compact GitHub link at the very bottom. Both
+ * live ONLY here, not in the main app body, per design.
  */
 @Composable
 private fun SettingsDialog(
     currentClassId: String,
+    moduleColorsEnabled: Boolean,
+    validationError: String?,
+    isValidating: Boolean,
     onDismiss: () -> Unit,
-    onSave: (String) -> Unit,
+    onSave: (String, Boolean) -> Unit,
 ) {
     // Local mirror of the input so the text field shows what the user is
     // typing immediately. We push the trimmed value back through [onSave]
     // on confirm; if the user backs out we discard.
     var draft by remember(currentClassId) { mutableStateOf(currentClassId) }
-    var error by remember(currentClassId) { mutableStateOf<String?>(null) }
+    var emptyInputError by remember(currentClassId) { mutableStateOf<String?>(null) }
+    // Mirror of the toggle so flipping the switch updates instantly
+    // without re-persisting on every change. The saved value goes
+    // through [onSave] on confirm; cancelling discards both drafts.
+    var moduleColorsDraft by remember(moduleColorsEnabled) {
+        mutableStateOf(moduleColorsEnabled)
+    }
     val focusRequester = remember(currentClassId) { FocusRequester() }
     LaunchedEffect(currentClassId) {
         focusRequester.requestFocus()
     }
+    // The OutlinedTextField's `isError` / `supportingText` flags
+    // combine two error states: "the field is empty" (local) and "the
+    // server rejected the value" (parent-owned, comes from
+    // [validationError]). Whichever is non-null wins.
+    val effectiveError: String? = emptyInputError ?: validationError
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -535,13 +678,13 @@ private fun SettingsDialog(
                     value = draft,
                     onValueChange = {
                         draft = it
-                        error = null
+                        emptyInputError = null
                     },
                     label = { Text("z. B. 3it24-1") },
                     placeholder = { Text(TimetableRepository.DEFAULT_CLASS_ID) },
                     singleLine = true,
-                    isError = error != null,
-                    supportingText = error?.let { { Text(it) } },
+                    isError = effectiveError != null,
+                    supportingText = effectiveError?.let { { Text(it) } },
                     modifier = Modifier
                         .fillMaxWidth()
                         .focusRequester(focusRequester),
@@ -554,36 +697,108 @@ private fun SettingsDialog(
                         onDone = {
                             val trimmed = draft.trim()
                             if (trimmed.isEmpty()) {
-                                error = "Bitte etwas eingeben"
+                                emptyInputError = "Bitte etwas eingeben"
                             } else {
-                                onSave(trimmed)
+                                onSave(trimmed, moduleColorsDraft)
                             }
                         },
                     ),
                 )
                 Text(
-                    text = "Gilt für die in-app Ansicht. Die Seminargruppe " +
-                        "eines Widgets wird separat in den Widget-" +
-                        "Einstellungen festgelegt.",
+                    text = "Wird für die Stundenplan URL verwendet.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                // --- Per-module color toggle ---
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Farbige Module",
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        Text(
+                            text = "Jedes Modul bekommt eine eigene Farbe. " +
+                                "Parallele Module werden als Verlauf " +
+                                "dargestellt.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(
+                        checked = moduleColorsDraft,
+                        onCheckedChange = { moduleColorsDraft = it },
+                    )
+                }
+                // --- Maintenance notice + GitHub link (tiny, at the end) ---
+                val ctx = LocalContext.current
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.End,
+                ) {
+                    Text(
+                        text = "Ungewartet ab 04/2027",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    TextButton(
+                        onClick = {
+                            val intent = Intent(
+                                Intent.ACTION_VIEW,
+                                "https://github.com/KuramaSyu/dhsn-stundenplan-widget".toUri(),
+                            )
+                            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            runCatching { ctx.startActivity(intent) }
+                        },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                        modifier = Modifier.height(28.dp),
+                    ) {
+                        Icon(
+                            imageVector = NavIcons.GitHub,
+                            contentDescription = null,
+                            modifier = Modifier.size(14.dp),
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "KuramaSyu/dhsn-stundenplan-widget",
+                            style = MaterialTheme.typography.labelSmall,
+                            maxLines = 1,
+                        )
+                    }
+                }
             }
         },
         confirmButton = {
-            TextButton(onClick = {
-                val trimmed = draft.trim()
-                if (trimmed.isEmpty()) {
-                    error = "Bitte etwas eingeben"
+            TextButton(
+                onClick = {
+                    val trimmed = draft.trim()
+                    if (trimmed.isEmpty()) {
+                        emptyInputError = "Bitte etwas eingeben"
+                    } else {
+                        onSave(trimmed, moduleColorsDraft)
+                    }
+                },
+                enabled = !isValidating,
+            ) {
+                if (isValidating) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                    )
                 } else {
-                    onSave(trimmed)
+                    Text("Speichern")
                 }
-            }) {
-                Text("Speichern")
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
+            TextButton(onClick = onDismiss, enabled = !isValidating) {
                 Text("Abbrechen")
             }
         },
@@ -600,6 +815,7 @@ private fun TimelineList(
     displayMonday: LocalDate,
     listState: LazyListState,
     effectiveToday: LocalDate,
+    moduleColorsEnabled: Boolean,
 ) {
     LazyColumn(
         state = listState,
@@ -617,11 +833,18 @@ private fun TimelineList(
             // have no slots (e.g. a holiday Wed) deliberately don't
             // get the highlight, which keeps "Morgen" meaningful as
             // "next day with something on it".
+            // "Heute" and "Morgen" labels are about the CALENDAR, not
+            // about the data: today always wins, and tomorrow is
+            // (effectiveToday + 1) regardless of whether that day has
+            // lessons. Showing "Morgen · Freitag, 14.10." on an empty
+            // Friday makes the marker meaningful in isolation — the
+            // user knows they're staring at tomorrow even when nothing
+            // is scheduled.
             DaySection(
                 day = day,
                 isToday = day.date == effectiveToday,
-                isTomorrow = day.date == effectiveToday.plusDays(1)
-                    && day.slots.isNotEmpty(),
+                isTomorrow = day.date == effectiveToday.plusDays(1),
+                moduleColorsEnabled = moduleColorsEnabled,
             )
         }
     }
@@ -632,6 +855,7 @@ private fun DaySection(
     day: DayPlan,
     isToday: Boolean,
     isTomorrow: Boolean = false,
+    moduleColorsEnabled: Boolean = false,
 ) {
     Column(modifier = Modifier.fillMaxWidth()) {
         DayHeader(day = day, isToday = isToday, isTomorrow = isTomorrow)
@@ -639,7 +863,7 @@ private fun DaySection(
         if (day.slots.isEmpty()) {
             EmptyDayCard(date = day.date)
         } else {
-            TimelineForDay(slots = day.slots)
+            TimelineForDay(slots = day.slots, moduleColorsEnabled = moduleColorsEnabled)
         }
     }
 }
@@ -715,7 +939,10 @@ private fun EmptyDayCard(date: LocalDate) {
 // ---------------------------------------------------------------------------
 
 @Composable
-private fun TimelineForDay(slots: List<LessonSlot>) {
+private fun TimelineForDay(
+    slots: List<LessonSlot>,
+    moduleColorsEnabled: Boolean = false,
+) {
     // Build 90-min blocks per lesson, then collapse parallel modules
     // (same visible time + same originalEnd) into single [BlockGroup]s
     // so the UI can render one card with two side-by-side columns.
@@ -733,7 +960,7 @@ private fun TimelineForDay(slots: List<LessonSlot>) {
                 // Defensive: shouldn't happen because the caller only
                 // calls us when slots is non-empty.
             } else {
-                TimelineColumn(groups = groups)
+                TimelineColumn(groups = groups, moduleColorsEnabled = moduleColorsEnabled)
             }
         }
     }
@@ -942,7 +1169,10 @@ private fun computeTodayButtonWeekOffset(today: LocalDate): Int = when (today.da
  * horizontal space on phones for no information gain.
  */
 @Composable
-private fun TimelineColumn(groups: List<BlockGroup>) {
+private fun TimelineColumn(
+    groups: List<BlockGroup>,
+    moduleColorsEnabled: Boolean = false,
+) {
     Column(modifier = Modifier.fillMaxWidth().padding(end = 12.dp, bottom = 12.dp)) {
         groups.forEachIndexed { index, group ->
             val previousEnd = groups.getOrNull(index - 1)?.end
@@ -956,7 +1186,7 @@ private fun TimelineColumn(groups: List<BlockGroup>) {
             ) {
                 PauseLabel(from = previousEnd, to = group.start)
             }
-            LessonCard(group = group)
+            LessonCard(group = group, moduleColorsEnabled = moduleColorsEnabled)
         }
     }
 }
@@ -1004,7 +1234,10 @@ private fun PauseLabel(from: LocalTime, to: LocalTime) {
  * one-chunk-on-screen presentation isn't a surprise.
  */
 @Composable
-private fun LessonCard(group: BlockGroup) {
+private fun LessonCard(
+    group: BlockGroup,
+    moduleColorsEnabled: Boolean = false,
+) {
     val timeFmt = DateTimeFormatter.ofPattern("HH:mm", Locale.GERMAN)
     val rangeLabel = "${group.start.format(timeFmt)} – ${group.end.format(timeFmt)}"
 
@@ -1012,31 +1245,86 @@ private fun LessonCard(group: BlockGroup) {
     // 90-min chunk of a multi-chunk lesson. We identify the leading
     // chunk by "this lesson's first slot (`lesson.start`) coincides
     // with this chunk's start" AND we know it's actually a multi-chunk
-// lesson by "the merged-lesson end (`group.originalEnd`) is past the
-// visible chunk end (`group.end`).
-//
-// Note: `lesson.start` / `lesson.end` here are the very first slot's
-// times (the [Lesson] object stored in each [Block] is the original
-// one emitted by the scraper and is never rewritten when the merged
-// lesson is extended — only `tail.lessonEnd` on the [Merged] is
-// updated, and `originalEnd` reflects that updated end).
-val isSplitFirstChunk = group.lessons.any { lesson ->
-    lesson.start == group.start && group.originalEnd != group.end
-}
+    // lesson by "the merged-lesson end (`group.originalEnd`) is past the
+    // visible chunk end (`group.end`).
+    //
+    // Note: `lesson.start` / `lesson.end` here are the very first slot's
+    // times (the [Lesson] object stored in each [Block] is the original
+    // one emitted by the scraper and is never rewritten when the merged
+    // lesson is extended — only `tail.lessonEnd` on the [Merged] is
+    // updated, and `originalEnd` reflects that updated end).
+    val isSplitFirstChunk = group.lessons.any { lesson ->
+        lesson.start == group.start && group.originalEnd != group.end
+    }
 
     // Local expand state for the original-time disclosure.
     var expanded by remember(group.start, group.end, group.originalEnd) {
         mutableStateOf(false)
     }
 
+    // Per-lesson container colors. When [moduleColorsEnabled] is false
+    // we fall back to the static `secondaryContainer` for every lesson —
+    // the result is identical to the pre-feature layout.
+    //
+    // When enabled, each lesson gets a container color derived from a
+    // stable hue rotation of the base `secondaryContainer` color. For
+    // a single-lesson card we apply it directly. For a multi-lesson
+    // card we build a horizontal gradient whose stops land at the
+    // midpoint between adjacent lessons, so each module owns its own
+    // band of color.
+    val baseContainer = MaterialTheme.colorScheme.secondaryContainer
+    val defaultOnContainer = MaterialTheme.colorScheme.onSecondaryContainer
+    val perLessonContainers: List<Color> = remember(
+        group.lessons,
+        moduleColorsEnabled,
+        baseContainer,
+    ) {
+        if (!moduleColorsEnabled) {
+            group.lessons.map { baseContainer }
+        } else {
+            group.lessons.map { lesson ->
+                val hue = ModuleColors.hueDegreesFor(lesson) ?: 0f
+                ModuleColors.rotateHue(baseContainer, hue)
+            }
+        }
+    }
+    // The "ink" color used for the time row + body text. We pick it
+    // from the first lesson's container so a card with multiple
+    // modules uses a single readable on-color across its whole header.
+    val onContainer = remember(perLessonContainers) {
+        perLessonContainers.firstOrNull()
+            ?.let { ModuleColors.onColorFor(it) }
+            ?: defaultOnContainer
+    }
+
+    // The card background. For a single-lesson group it's a flat
+    // color; for a parallel group it's a horizontal gradient with one
+    // band per lesson. We split each band evenly so the transitions
+    // between modules land exactly at the midpoint between adjacent
+    // lessons.
+//
+// Implementation note: Brush.horizontalGradient requires strictly
+// increasing stop positions in `[0f, 1f]`. We use the simplest
+// approach — pass `perLessonContainers` as the gradient's color list
+// and let Compose distribute them at evenly-spaced stops. This
+// produces a smooth gradient that crosses each band, which is what
+// the user asked for ("add gradients to modules which are at the
+// same time"). Trying to force hard colour edges would mean duplicate
+// stops, which Compose's brush API rejects with IllegalArgumentException.
+    val cardBackgroundModifier: Modifier = if (group.lessons.size <= 1) {
+        Modifier.background(color = perLessonContainers.first(), shape = RoundedCornerShape(8.dp))
+    } else {
+        Modifier.background(
+            brush = Brush.horizontalGradient(perLessonContainers),
+            shape = RoundedCornerShape(8.dp),
+        )
+    }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .padding(bottom = 8.dp)
-            .background(
-                color = MaterialTheme.colorScheme.secondaryContainer,
-                shape = RoundedCornerShape(8.dp),
-            )
+            .then(cardBackgroundModifier)
             .padding(horizontal = 12.dp, vertical = 8.dp),
     ) {
         // Card time row: clock icon + range, (i) disclosure trailing.
@@ -1049,7 +1337,7 @@ val isSplitFirstChunk = group.lessons.any { lesson ->
                 Icon(
                     imageVector = NavIcons.Schedule,
                     contentDescription = null,
-                    tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                    tint = onContainer,
                     modifier = Modifier.size(16.dp),
                 )
                 Spacer(modifier = Modifier.width(4.dp))
@@ -1057,7 +1345,7 @@ val isSplitFirstChunk = group.lessons.any { lesson ->
                     text = rangeLabel,
                     style = MaterialTheme.typography.labelMedium,
                     fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    color = onContainer,
                 )
             }
             if (isSplitFirstChunk) {
@@ -1072,7 +1360,7 @@ val isSplitFirstChunk = group.lessons.any { lesson ->
                         } else {
                             "Original-Zeitfenster anzeigen"
                         },
-                        tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                        tint = onContainer,
                         modifier = Modifier.size(16.dp),
                     )
                 }
@@ -1085,15 +1373,26 @@ val isSplitFirstChunk = group.lessons.any { lesson ->
         // parallel modules). Each column shows subject, then the
         // chip+separator info row.
         if (group.lessons.size == 1) {
-            LessonColumn(lesson = group.lessons[0])
+            LessonColumn(
+                lesson = group.lessons[0],
+                onContainer = onContainer,
+            )
         } else {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                group.lessons.forEach { lesson ->
+                group.lessons.forEachIndexed { index, lesson ->
+                    // Each side of the card has its own on-color picked
+                    // from THAT lesson's container, so contrast holds
+                    // even if the parallel modules have very different
+                    // hues (e.g. a dark teal next to a pale yellow).
+                    val columnOn = ModuleColors.onColorFor(
+                        perLessonContainers[index],
+                    )
                     LessonColumn(
                         lesson = lesson,
+                        onContainer = columnOn,
                         modifier = Modifier.weight(1f),
                     )
                 }
@@ -1111,11 +1410,13 @@ val isSplitFirstChunk = group.lessons.any { lesson ->
             Text(
                 text = "Original: $timeRange · $subjectList",
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.85f),
+                color = onContainer.copy(alpha = 0.85f),
             )
         }
     }
 }
+
+
 
 /**
  * Renders the per-module body of a [LessonCard]. Layout, top-to-bottom:
@@ -1135,13 +1436,14 @@ val isSplitFirstChunk = group.lessons.any { lesson ->
 private fun LessonColumn(
     lesson: Lesson,
     modifier: Modifier = Modifier,
+    onContainer: Color = MaterialTheme.colorScheme.onSecondaryContainer,
 ) {
     Column(modifier = modifier) {
         Text(
             text = lesson.subject.ifBlank { "(kein Fach)" },
             style = MaterialTheme.typography.titleSmall,
             fontWeight = FontWeight.SemiBold,
-            color = MaterialTheme.colorScheme.onSecondaryContainer,
+            color = onContainer,
         )
         Spacer(modifier = Modifier.height(4.dp))
         // Chip row: teacher + room side-by-side.
@@ -1154,12 +1456,14 @@ private fun LessonColumn(
                     InfoChip(
                         icon = NavIcons.Person,
                         label = lesson.teacher,
+                        onContainer = onContainer,
                     )
                 }
                 if (lesson.room.isNotBlank()) {
                     InfoChip(
                         icon = NavIcons.DoorFront,
                         label = lesson.room,
+                        onContainer = onContainer,
                     )
                 }
             }
@@ -1175,7 +1479,7 @@ private fun LessonColumn(
             Text(
                 text = tail.joinToString(" · "),
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.75f),
+                color = onContainer.copy(alpha = 0.75f),
             )
         }
     }
@@ -1204,11 +1508,16 @@ private fun LessonColumn(
 private fun InfoChip(
     icon: ImageVector,
     label: String,
+    onContainer: Color = MaterialTheme.colorScheme.onSecondaryContainer,
 ) {
+    // The chip background uses the lesson's container color (rather
+    // than the theme's static `tertiaryContainer`) so each module's
+    // chip belongs visually to its own band of color. Text + icon
+    // pick up the matching on-color so contrast stays correct.
     Row(
         modifier = Modifier
             .background(
-                color = MaterialTheme.colorScheme.tertiaryContainer,
+                color = onContainer.copy(alpha = 0.18f),
                 shape = RoundedCornerShape(4.dp),
             )
             .padding(horizontal = 6.dp, vertical = 2.dp),
@@ -1217,14 +1526,14 @@ private fun InfoChip(
         Icon(
             imageVector = icon,
             contentDescription = null,
-            tint = MaterialTheme.colorScheme.onTertiaryContainer,
+            tint = onContainer,
             modifier = Modifier.size(14.dp),
         )
         Spacer(modifier = Modifier.width(4.dp))
         Text(
             text = label,
             style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onTertiaryContainer,
+            color = onContainer,
         )
     }
 }
@@ -1334,41 +1643,6 @@ private object NavIcons {
             horizontalLineTo(12f)
             verticalLineTo(15f)
             horizontalLineTo(7f)
-            close()
-        }
-    }.build()
-
-    val Refresh: ImageVector = ImageVector.Builder(
-        name = "Refresh",
-        defaultWidth = 24.dp,
-        defaultHeight = 24.dp,
-        viewportWidth = 24f,
-        viewportHeight = 24f,
-    ).apply {
-        path(
-            fill = SolidColor(Color.Black),
-            fillAlpha = 1f,
-            stroke = null,
-            strokeLineWidth = 0f,
-            strokeLineCap = StrokeCap.Butt,
-            strokeLineJoin = StrokeJoin.Miter,
-            strokeLineMiter = 4f,
-            pathFillType = PathFillType.NonZero,
-        ) {
-            // Circular arrow – two arcs forming a "refresh" loop.
-            moveTo(17.65f, 6.35f)
-            curveTo(16.2f, 4.9f, 14.21f, 4f, 12f, 4f)
-            curveTo(7.58f, 4f, 4f, 7.58f, 4f, 12f)
-            curveTo(4f, 16.42f, 7.58f, 20f, 12f, 20f)
-            curveTo(15.73f, 20f, 18.84f, 17.45f, 19.73f, 14f)
-            horizontalLineTo(17.65f)
-            curveTo(16.83f, 16.33f, 14.61f, 18f, 12f, 18f)
-            curveTo(8.69f, 18f, 6f, 15.31f, 6f, 12f)
-            curveTo(6f, 8.69f, 8.69f, 6f, 12f, 6f)
-            curveTo(13.66f, 6f, 15.14f, 6.69f, 16.22f, 7.78f)
-            lineTo(13f, 11f)
-            horizontalLineTo(20f)
-            verticalLineTo(4f)
             close()
         }
     }.build()
@@ -1578,6 +1852,60 @@ private object NavIcons {
             curveTo(14f, 16.9f, 13.1f, 16f, 12f, 16f)
             curveTo(10.9f, 16f, 10f, 16.9f, 10f, 18f)
             curveTo(10f, 19.1f, 10.9f, 20f, 12f, 20f)
+            close()
+        }
+    }.build()
+
+    /**
+     * GitHub mark (octocat silhouette). Path data copied from the
+     * GitHub Logos repo under the MIT/CC0 licence — a single closed
+     * shape, fill-only. Used as the leading icon on the "open the
+     * repo" button inside [SettingsDialog].
+     */
+    val GitHub: ImageVector = ImageVector.Builder(
+        name = "GitHub",
+        defaultWidth = 24.dp,
+        defaultHeight = 24.dp,
+        viewportWidth = 24f,
+        viewportHeight = 24f,
+    ).apply {
+        path(
+            fill = SolidColor(Color.Black),
+            fillAlpha = 1f,
+            stroke = null,
+            strokeLineWidth = 0f,
+            strokeLineCap = StrokeCap.Butt,
+            strokeLineJoin = StrokeJoin.Miter,
+            strokeLineMiter = 4f,
+            pathFillType = PathFillType.NonZero,
+        ) {
+            // Standard GitHub mark outline + filled body.
+            moveTo(12f, 2f)
+            curveTo(6.477f, 2f, 2f, 6.484f, 2f, 12.017f)
+            curveTo(2f, 16.435f, 4.865f, 20.169f, 8.839f, 21.505f)
+            curveTo(9.339f, 21.605f, 9.521f, 21.286f, 9.521f, 21.006f)
+            curveTo(9.521f, 20.751f, 9.512f, 20.014f, 9.508f, 19.222f)
+            curveTo(6.726f, 19.806f, 6.139f, 17.978f, 6.139f, 17.978f)
+            curveTo(5.685f, 16.852f, 5.013f, 16.533f, 5.013f, 16.533f)
+            curveTo(4.071f, 15.892f, 5.077f, 15.906f, 5.077f, 15.906f)
+            curveTo(6.109f, 15.97f, 6.692f, 16.957f, 6.692f, 16.957f)
+            curveTo(7.625f, 18.476f, 9.121f, 18.012f, 9.541f, 17.749f)
+            curveTo(9.631f, 17.161f, 9.85f, 16.764f, 10.095f, 16.547f)
+            curveTo(7.815f, 16.302f, 5.421f, 15.466f, 5.421f, 11.758f)
+            curveTo(5.421f, 10.694f, 5.795f, 9.829f, 6.397f, 9.155f)
+            curveTo(6.297f, 8.92f, 5.972f, 7.997f, 6.495f, 6.726f)
+            curveTo(6.495f, 6.726f, 7.297f, 6.466f, 9.502f, 7.789f)
+            curveTo(10.293f, 7.585f, 11.139f, 7.483f, 11.978f, 7.479f)
+            curveTo(12.817f, 7.483f, 13.663f, 7.585f, 14.455f, 7.789f)
+            curveTo(16.658f, 6.466f, 17.459f, 6.726f, 17.459f, 6.726f)
+            curveTo(17.984f, 7.997f, 17.659f, 8.92f, 17.559f, 9.155f)
+            curveTo(18.163f, 9.829f, 18.535f, 10.694f, 18.535f, 11.758f)
+            curveTo(18.535f, 15.478f, 16.138f, 16.299f, 13.852f, 16.539f)
+            curveTo(14.146f, 16.792f, 14.41f, 17.302f, 14.41f, 18.084f)
+            curveTo(14.41f, 19.177f, 14.399f, 20.057f, 14.399f, 20.273f)
+            curveTo(14.399f, 20.555f, 14.578f, 20.878f, 15.084f, 20.773f)
+            curveTo(19.058f, 19.439f, 21.918f, 15.704f, 21.918f, 12.017f)
+            curveTo(21.918f, 6.484f, 17.438f, 2f, 12f, 2f)
             close()
         }
     }.build()

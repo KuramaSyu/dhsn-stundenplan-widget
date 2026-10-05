@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -134,6 +135,78 @@ object TimetableRepository {
             "?akttyp=1&aktwert=$classId&legendefach=on"
         Log.d(TAG, "buildUrl(widgetId=$appWidgetId) -> $url")
         return url
+    }
+
+    /**
+     * One-shot result of [validateClassId]. Used by the in-app
+     * settings dialog so the user only commits a seminargruppe after
+     * we successfully reach the BA server with it (or after we
+     * determine the device is offline).
+     */
+    sealed class ValidationResult {
+        /** Server returned a usable plan. */
+        object Valid : ValidationResult()
+
+        /** Reached the server but it returned no / unparseable HTML. */
+        object InvalidServerResponse : ValidationResult()
+
+        /**
+         * Couldn't reach the server at all (no DNS, no network, etc.).
+         * The original [cause] is preserved so callers can show a
+         * precise reason in their own UI.
+         */
+        data class Offline(val cause: Throwable) : ValidationResult()
+    }
+
+    /**
+     * Validate that [classId] is accepted by the BA-Dresden PlanServlet
+     * without committing anything to our in-memory or on-disk caches.
+     *
+     * Used by the in-app settings dialog before persisting a freshly-
+     * entered seminargruppe. We deliberately DO NOT route through
+     * [refresh] or [fetchAndCacheWeeks] because those write to the
+     * cache for the CURRENTLY-active class id — we don't want a failed
+     * validation of a brand-new id to evict the user's previously-
+     * working cache.
+     *
+     * Returns one of:
+     *   * [ValidationResult.Valid] — the server returned a parseable
+     *     HTML response with at least one week.
+     *   * [ValidationResult.InvalidServerResponse] — server returned
+     *     something but the parse came up empty (or threw).
+     *   * [ValidationResult.Offline] — the network call failed; the
+     *     caller is expected to accept the input anyway.
+     */
+    suspend fun validateClassId(classId: String): ValidationResult {
+        val trimmed = classId.trim()
+        if (trimmed.isEmpty()) {
+            return ValidationResult.InvalidServerResponse
+        }
+        val url = "https://stundenplan.ba-dresden.de/stundenplan/PlanServlet" +
+            "?akttyp=1&aktwert=$trimmed&legendefach=on"
+        Log.d(TAG, "validateClassId($trimmed) -> $url")
+        return try {
+            val html = withContext(Dispatchers.IO) { fetcher.fetch(url) }
+            val weeks = TimetableScraper.parseWeeks(html)
+            if (weeks.isNotEmpty()) {
+                Log.d(TAG, "validateClassId($trimmed) -> Valid (${weeks.size} weeks)")
+                ValidationResult.Valid
+            } else {
+                Log.w(TAG, "validateClassId($trimmed) -> InvalidServerResponse (parsed empty)")
+                ValidationResult.InvalidServerResponse
+            }
+        } catch (e: CancellationException) {
+            // Honour coroutine cancellation; let it bubble up.
+            throw e
+        } catch (e: java.io.IOException) {
+            Log.w(TAG, "validateClassId($trimmed) -> Offline: ${e.message}")
+            ValidationResult.Offline(e)
+        } catch (e: Throwable) {
+            // Anything else (parse error, HttpUrlConnection HTTP error,
+            // etc.) counts as "server answered but it's broken".
+            Log.w(TAG, "validateClassId($trimmed) -> InvalidServerResponse: ${e.message}")
+            ValidationResult.InvalidServerResponse
+        }
     }
 
     /**
@@ -409,6 +482,45 @@ object TimetableRepository {
      * [resolveClassId] falls back to [DEFAULT_CLASS_ID].
      */
     private val globalClassIdKey = stringPreferencesKey("global_class_id")
+
+    /**
+     * Per-app boolean toggle for the in-app timeline's "show a distinct
+     * color per module" feature. Stored in the same `widget_fetch`
+     * DataStore as the global class id because it's also a global
+     * (non-widget-scoped) preference that survives configuration
+     * changes. Default: `false` (off).
+     */
+    private val moduleColorsEnabledKey = booleanPreferencesKey("module_colors_enabled")
+
+    /**
+     * Persist the "module colors" toggle used by the in-app timeline
+     * viewer. Safe to call with the same value repeatedly; the DataStore
+     * write is a no-op in that case.
+     */
+    suspend fun saveModuleColorsEnabled(context: Context, enabled: Boolean) {
+        try {
+            context.fetchDataStore.edit { prefs ->
+                prefs[moduleColorsEnabledKey] = enabled
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            Log.w(TAG, "saveModuleColorsEnabled($enabled) failed: ${e.message}")
+        }
+    }
+
+    /** Returns the persisted "module colors" toggle, or `false` if unset. */
+    suspend fun readModuleColorsEnabled(context: Context): Boolean =
+        try {
+            context.fetchDataStore.data
+                .map { it[moduleColorsEnabledKey] ?: false }
+                .first()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            Log.w(TAG, "readModuleColorsEnabled() failed: ${e.message}")
+            false
+        }
 
     /** Persist the seminargruppe used by the in-app timeline viewer. */
     suspend fun saveGlobalClassId(context: Context, classId: String) {
